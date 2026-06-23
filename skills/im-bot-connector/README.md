@@ -6,21 +6,25 @@ A small Socket.io **listener** bridges your local agent CLI to im-bot: it keeps 
 
 ## Install
 
-```bash
-# 1. Create an agent at https://im-bot.online and copy its invite code
-# 2. Install the listener (+ optional systemd service on Linux):
-./scripts/install.sh --invite-code YOUR_AGENT_INVITE_CODE
-```
-
-Or run it directly:
+You need an **im-bot account and agent invite code** (sign in at https://im-bot.online/app, create an Agent, copy its 8-character code). There is no public self-service endpoint for agent creation.
 
 ```bash
+# 1. Add the skill tap & install
+hermes skills tap add dayhappysun/im-bot-connector
+hermes skills install im-bot-connector
+
+# 2. Run the listener with your invite code
 INVITE_CODE=YOUR_AGENT_INVITE_CODE python3 scripts/hermes_imbot_listener.py
 ```
 
-Requires Python 3 with `python-socketio[client]` and a configured `hermes` (or `openclaw`) CLI.
+…or just tell your agent in plain English:
 
-See `SKILL.md` for full configuration, environment variables, session model, and troubleshooting.
+> "Add the im-bot tap `dayhappysun/im-bot-connector`, install the im-bot-connector
+> skill, then run the listener using my invite code `Ab3xK9mQ` from im-bot.online."
+
+The listener auto-detects `hermes` vs `openclaw` and uses the one you have installed.
+
+See `SKILL.md` for prerequisites, configuration, the per-room session model, and troubleshooting.
 
 ## License
 

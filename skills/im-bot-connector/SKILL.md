@@ -6,13 +6,15 @@ description: >-
   listener that gives each chat room its own persistent agent session, handles
   file attachments, and supports in-chat model switching. Backend-agnostic
   (auto-detects hermes or openclaw).
-version: 1.0.0
+version: 1.0.1
 license: MIT
 tags: [im-bot, connector, socket.io, agent, messaging, hermes, openclaw, listener]
 trigger: >-
   User wants to connect their Hermes or OpenClaw agent to im-bot, register/run an
   agent on im-bot, set up the im-bot agent listener, or chat with their agent from
-  the im-bot web/app client.
+  the im-bot web/app client. Also triggered when the user says they want their
+  agent to "join im-bot", "connect to im-bot", or asks in natural language for
+  the agent to install the im-bot connector.
 metadata:
   hermes:
     homepage: https://im-bot.online
@@ -35,10 +37,31 @@ This skill runs a small **listener** that bridges your local agent CLI to im-bot
 ## Prerequisites
 
 1. A working `hermes` (or `openclaw`) CLI on this machine, configured with a model/provider.
-2. An **im-bot account** and an **agent invite code** — create an agent at https://im-bot.online and copy its invite code.
+2. An **im-bot account** and an **agent invite code**:
+   - Register/sign in at https://im-bot.online/app
+   - Create an Agent — either via the dashboard or programmatically:
+     `POST /api/agents` with `{name, description, systemPrompt}` (or call
+     `api.agents.create()` from the web client). There is no public self-service
+     endpoint; agent creation is gated to logged-in users.
+   - Copy the 8-character `inviteCode` from the Agent details page.
 3. Python 3 with `python-socketio[client]` (`pip install "python-socketio[client]"`).
 
 ## Quick start
+
+If you already have your im-bot account + agent invite code, you have **two equivalent options**:
+
+### Option A — tell your agent in plain English
+
+Open a chat with your local Hermes or OpenClaw agent and say something like:
+
+> "Add the im-bot tap `dayhappysun/im-bot-connector`, install the im-bot-connector
+> skill, then run the listener using my invite code `Ab3xK9mQ` from im-bot.online."
+
+The agent will run `hermes skills tap add`, `hermes skills install im-bot-connector`,
+and launch the listener with your invite code. You'll see the new Room appear in
+the im-bot web client within a few seconds.
+
+### Option B — run the installer yourself
 
 ```bash
 # From the skill's scripts/ directory
@@ -51,9 +74,9 @@ This skill runs a small **listener** that bridges your local agent CLI to im-bot
 `install.sh` installs the listener and (on Linux) registers a `hermes-imbot` systemd user service so it runs in the background and restarts on boot.
 
 To run it manually instead:
-
 ```bash
 INVITE_CODE=YOUR_AGENT_INVITE_CODE python3 hermes_imbot_listener.py
+```
 ```
 
 ## Configuration

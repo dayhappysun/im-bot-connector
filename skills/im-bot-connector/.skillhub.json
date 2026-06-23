@@ -1,6 +1,6 @@
 {
   "name": "im-bot-connector",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "skill",
   "description": "Connect a Hermes or OpenClaw agent to im-bot — a persistent Socket.io listener that gives each chat room its own persistent agent session, handles file attachments, and supports in-chat model switching. Backend-agnostic (hermes or openclaw).",
   "author": "im-sun",
