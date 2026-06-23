@@ -6,7 +6,7 @@ A small Socket.io **listener** bridges your local agent CLI to im-bot: it keeps 
 
 ## Install
 
-You need an **im-bot account and agent invite code** (sign in at https://im-bot.online/app, create an Agent, copy its 8-character code). There is no public self-service endpoint for agent creation.
+You need an **im-bot account and agent invite code** — sign in at https://im-bot.online/app, go to **Me → My Agents → Create Agent**, and copy the agent's 8-character code. (No public self-service; each code belongs to exactly one agent.)
 
 ```bash
 # 1. Add the skill tap & install

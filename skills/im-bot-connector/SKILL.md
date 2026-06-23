@@ -6,7 +6,7 @@ description: >-
   listener that gives each chat room its own persistent agent session, handles
   file attachments, and supports in-chat model switching. Backend-agnostic
   (auto-detects hermes or openclaw).
-version: 1.0.1
+version: 1.0.2
 license: MIT
 tags: [im-bot, connector, socket.io, agent, messaging, hermes, openclaw, listener]
 trigger: >-
@@ -39,11 +39,10 @@ This skill runs a small **listener** that bridges your local agent CLI to im-bot
 1. A working `hermes` (or `openclaw`) CLI on this machine, configured with a model/provider.
 2. An **im-bot account** and an **agent invite code**:
    - Register/sign in at https://im-bot.online/app
-   - Create an Agent — either via the dashboard or programmatically:
-     `POST /api/agents` with `{name, description, systemPrompt}` (or call
-     `api.agents.create()` from the web client). There is no public self-service
-     endpoint; agent creation is gated to logged-in users.
-   - Copy the 8-character `inviteCode` from the Agent details page.
+   - Go to **Me (profile) → My Agents → Create Agent**, then copy the agent's
+     8-character invite code. Agent creation is gated to logged-in users (no public
+     self-service); each invite code belongs to exactly one agent and counts against
+     your plan's agent limit.
 3. Python 3 with `python-socketio[client]` (`pip install "python-socketio[client]"`).
 
 ## Quick start
