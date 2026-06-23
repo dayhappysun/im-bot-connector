@@ -36,7 +36,7 @@ import subprocess
 import socketio
 
 # -- Configuration ----------------------------------
-IMBOT_URL = os.environ.get('IMBOT_URL', 'https://im-bot.online')
+IMBOT_URL = os.environ.get('IMBOT_URL', 'https://im-bot.net')
 INVITE_CODE = os.environ.get('INVITE_CODE', 'YOUR_AGENT_INVITE_CODE')
 IMBOT_MODEL = os.environ.get('IMBOT_MODEL', '')
 IMBOT_TOOLSETS = os.environ.get('IMBOT_TOOLSETS', '')  # empty = profile default

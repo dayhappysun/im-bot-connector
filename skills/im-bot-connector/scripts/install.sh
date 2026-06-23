@@ -19,7 +19,7 @@
 set -euo pipefail
 
 INVITE_CODE=""
-SERVER_URL="https://im-bot.online"
+SERVER_URL="https://im-bot.net"
 HERMES_MODEL="${HERMES_INFERENCE_MODEL:-}"
 IMBOT_BACKEND="${IMBOT_BACKEND:-auto}"
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -36,11 +36,11 @@ while [[ $# -gt 0 ]]; do
       echo ""
       echo "Options:"
       echo "  --invite-code CODE   Agent invite code from im-bot (required)"
-      echo "  --server URL         im-bot server URL (default: https://im-bot.online)"
+      echo "  --server URL         im-bot server URL (default: https://im-bot.net)"
       echo "  --model MODEL        Override model for responses (Hermes backend)"
       echo "  --backend NAME       Agent backend: hermes | openclaw | auto (default: auto)"
       echo ""
-      echo "Get your invite code: https://im-bot.online/app/ → Create Agent → copy code"
+      echo "Get your invite code: https://im-bot.net/app/ → Create Agent → copy code"
       exit 0
       ;;
     *) echo "Unknown flag: $1"; exit 1 ;;
@@ -48,7 +48,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$INVITE_CODE" ]]; then
-  echo "❌ --invite-code is required. Get it from https://im-bot.online/app/"
+  echo "❌ --invite-code is required. Get it from https://im-bot.net/app/"
   exit 1
 fi
 
@@ -160,5 +160,5 @@ echo "   Config:        ~/.hermes/imbot_agent.json"
 echo "   Logs:          tail -f /tmp/hermes_imbot.log"
 echo ""
 echo "   Try chatting with your agent:"
-echo "   https://im-bot.online/app/"
+echo "   https://im-bot.net/app/"
 echo "═══════════════════════════════════════════"
