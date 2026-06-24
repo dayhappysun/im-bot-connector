@@ -6,7 +6,7 @@ description: >-
   listener that gives each chat room its own persistent agent session, handles
   file attachments, and supports in-chat model switching. Backend-agnostic
   (auto-detects hermes or openclaw).
-version: 1.0.2
+version: 1.1.0
 license: MIT
 tags: [im-bot, connector, socket.io, agent, messaging, hermes, openclaw, listener]
 trigger: >-
@@ -99,7 +99,9 @@ The listener reads `~/.hermes/imbot_agent.json` (created by `install.sh`):
 | `IMBOT_AGENT_BIN` | Explicit path to the agent binary | auto-detected |
 | `IMBOT_MODEL` | Model override (Hermes backend) | profile default |
 | `IMBOT_TOOLSETS` | Restrict tools (e.g. `web,file`) | all |
-| `IMBOT_TIMEOUT` | Max seconds per agent turn | `180` |
+| `IMBOT_TIMEOUT` | How often to post a progress / "still working" update during a long turn (does **not** kill the run) | `60` |
+| `IMBOT_HARD_TIMEOUT` | Outer safety cap (seconds). `0` = unlimited (default): a task is **never** auto-killed. Set >0 only to reap leaked processes | `0` |
+| `IMBOT_AGENT_LOG` | Hermes' structured log, tailed to stream tool activity into the chat | `~/.hermes/logs/agent.log` |
 | `IMBOT_SOURCE` | Session source tag | `imbot` |
 
 ## How sessions work
@@ -125,7 +127,7 @@ The listener probes the target model with a quick test query. If the probe succe
 
 - **"Invalid invite code"** — the `INVITE_CODE` doesn't match an agent on the server. Re-copy it from your agent's page on im-bot.
 - **Agent shows offline** — check the listener is running (`systemctl --user status hermes-imbot`) and that the server URL is reachable.
-- **No reply / timeouts** — increase `IMBOT_TIMEOUT`; verify `hermes chat -q "ping" -Q` works locally.
+- **Long tasks** — a turn is **never** cut off on a wall clock (default `IMBOT_HARD_TIMEOUT=0` = unlimited; a task may run for hours). The listener streams real tool-execution progress to the chat and posts a "still working" notice every `IMBOT_TIMEOUT` seconds, and reports each running task to the server (`task:start`/`task:end`) for the room's task-list UI. If no real reply ever arrives, verify `hermes chat -q "ping" -Q` works locally.
 - **Logs** — the listener logs to stdout (or the systemd journal: `journalctl --user -u hermes-imbot -f`).
 - **Changed the listener code?** — restart the service (`systemctl --user restart hermes-imbot`) or kill and relaunch the process.
 
