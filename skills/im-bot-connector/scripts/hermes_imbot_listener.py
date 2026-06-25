@@ -634,8 +634,10 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
     rooms' messages) can still be received while this turn is running."""
     def send_progress(text):
         try:
+            # msgType 'progress' lets the web UI group these interim updates and
+            # auto-collapse them once the final reply (msgType 'text') arrives.
             sio.emit('message:send',
-                     {'roomId': room_id, 'content': text, 'msgType': 'text'},
+                     {'roomId': room_id, 'content': text, 'msgType': 'progress'},
                      namespace='/agent')
             sio.emit('typing:start', {'roomId': room_id}, namespace='/agent')
         except Exception as e:
