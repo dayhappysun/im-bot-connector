@@ -75,6 +75,7 @@ if os.path.exists(CONFIG_FILE):
 BACKEND_BINS = {
     'hermes':   ['hermes'],
     'openclaw': ['openclaw', 'claw'],
+    'claude':   ['claude'],
 }
 
 
@@ -90,7 +91,10 @@ def _detect_backend():
     explicit_bin = os.environ.get('IMBOT_AGENT_BIN', '').strip()
 
     def _infer_from_path(p):
-        return 'openclaw' if 'claw' in os.path.basename(p).lower() else 'hermes'
+        base = os.path.basename(p).lower()
+        if 'claude' in base: return 'claude'
+        if 'claw' in base: return 'openclaw'
+        return 'hermes'
 
     if explicit_bin:
         be = forced if forced in BACKEND_BINS else _infer_from_path(explicit_bin)
@@ -342,14 +346,22 @@ def handle_model_switch(room_id, target):
 
 
 def _build_cmd(resume_sid, content, room_id):
-    """Build the agent CLI command (Hermes/OpenClaw share this surface)."""
+    """Build the agent CLI command (backend-specific)."""
+    model = room_models.get(room_id) or IMBOT_MODEL
+    if BACKEND == 'claude':
+        cmd = [AGENT_BIN, '-p', content]
+        if resume_sid:
+            cmd.extend(['--resume', resume_sid])
+        if model:
+            cmd.extend(['--model', model])
+        return cmd
+    # hermes / openclaw
     if resume_sid:
         cmd = [AGENT_BIN, '-r', resume_sid, 'chat', '-q', content,
                '--source', IMBOT_SOURCE, '-Q']
     else:
         full = build_system_preamble() + content
         cmd = [AGENT_BIN, 'chat', '-q', full, '--source', IMBOT_SOURCE, '-Q']
-    model = room_models.get(room_id) or IMBOT_MODEL
     if model:
         cmd.extend(['-m', model])
     if IMBOT_TOOLSETS:
@@ -471,6 +483,12 @@ def call_agent(content, room_id, send_progress=None, task_id=None):
         # HERMES_INFERENCE_MODEL only meaningful for hermes; -m handles per-room
         if IMBOT_MODEL and BACKEND == 'hermes' and not room_models.get(room_id):
             env['HERMES_INFERENCE_MODEL'] = IMBOT_MODEL
+        # Claude Code: route through DeepSeek's Anthropic-compatible endpoint
+        if BACKEND == 'claude':
+            env['ANTHROPIC_BASE_URL'] = 'https://api.deepseek.com/v1'
+            env['ANTHROPIC_AUTH_TOKEN'] = (os.environ.get('DEEPSEEK_API_KEY') or
+                                            env.get('DEEPSEEK_API_KEY', ''))
+            env.setdefault('ANTHROPIC_AUTH_TOKEN', os.environ.get('ANTHROPIC_API_KEY', ''))
 
         cmd = _build_cmd(existing_sid, content, room_id)
 
