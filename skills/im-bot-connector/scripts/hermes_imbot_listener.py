@@ -50,6 +50,14 @@ IMBOT_TIMEOUT = int(os.environ.get('IMBOT_TIMEOUT', '60'))
 # reap genuinely-leaked processes.
 IMBOT_HARD_TIMEOUT = int(os.environ.get('IMBOT_HARD_TIMEOUT', '0'))
 IMBOT_SOURCE = os.environ.get('IMBOT_SOURCE', 'imbot')  # session source tag
+# Heartbeat self-healing: a half-open / "zombie" link (transport still alive but
+# the server has stopped acking) never raises on emit() and never fires the
+# 'disconnect' event, so the client can sit forever believing it is online while
+# the server has marked the agent offline. The server answers our 'heartbeat'
+# with 'heartbeat:ack'; if NO server->client event (ack OR any message) arrives
+# for IMBOT_STALE_AFTER seconds, the link is dead and we force a reconnect.
+IMBOT_HB_INTERVAL = int(os.environ.get('IMBOT_HB_INTERVAL', '30'))   # heartbeat cadence (s)
+IMBOT_STALE_AFTER = int(os.environ.get('IMBOT_STALE_AFTER', '100'))  # silence -> reconnect (s)
 # Hermes writes a structured per-session log here; tool events appear in it even
 # in -Q mode, so we tail it to stream tool-execution progress into the chat.
 AGENT_LOG_FILE = os.path.expanduser(
@@ -114,7 +122,17 @@ logging.basicConfig(
 log = logging.getLogger('imbot-agent')
 
 # -- Global state -----------------------------------
-sio = socketio.Client(logger=LOG_LEVEL == logging.DEBUG)
+sio = socketio.Client(
+    logger=LOG_LEVEL == logging.DEBUG,
+    reconnection=True,
+    reconnection_attempts=0,      # unlimited — keep retrying forever
+    reconnection_delay=1,
+    reconnection_delay_max=30,
+    randomization_factor=0.5,
+)
+# Liveness timestamp: refreshed by _touch() on ANY server->client event. The
+# heartbeat watchdog in main() treats a long silence here as a zombie link.
+_last_rx_ts = time.time()
 agent_id = None
 known_rooms = set()
 shutting_down = False
@@ -650,8 +668,15 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
 
 
 # -- Socket.io Event Handlers -----------------------
+def _touch():
+    """Mark the link alive: any server->client event resets the staleness clock."""
+    global _last_rx_ts
+    _last_rx_ts = time.time()
+
+
 @sio.on('connect', namespace='/agent')
 def on_connect():
+    _touch()
     log.info("Connected to im-bot /agent namespace at %s" % IMBOT_URL)
 
 
@@ -663,6 +688,7 @@ def on_disconnect():
 @sio.on('welcome', namespace='/agent')
 def on_welcome(data):
     global agent_id, known_rooms
+    _touch()
     agent_id = data.get('agentId')
     rooms = data.get('rooms', [])
     known_rooms = set(rooms)
@@ -689,6 +715,7 @@ def on_welcome(data):
 
 @sio.on('message:new', namespace='/agent')
 def on_message(msg):
+    _touch()
     content = msg.get('content', '') or ''
     sender_name = msg.get('senderName', 'Unknown')
     room_id = msg.get('roomId')
@@ -731,11 +758,13 @@ def on_message(msg):
 
 @sio.on('session:state', namespace='/agent')
 def on_session_state(data):
+    _touch()
     log.debug("Session state: %s" % str(data)[:200])
 
 
 @sio.on('heartbeat:ack', namespace='/agent')
 def on_heartbeat_ack(data):
+    _touch()  # the key liveness signal during quiet periods
     log.debug("Heartbeat ack: %s" % data.get('timestamp'))
 
 
@@ -746,6 +775,7 @@ def on_error(data):
 
 @sio.on('*', namespace='/agent')
 def on_any(event, data):
+    _touch()
     if event not in ('message:new', 'heartbeat:ack', 'session:state'):
         log.debug("  Event '%s': %s" % (event, str(data)[:200]))
 
@@ -795,7 +825,7 @@ def connect():
 
 
 def main():
-    global shutting_down, room_sessions, room_models
+    global shutting_down, room_sessions, room_models, _last_rx_ts
 
     def graceful_shutdown(signum, frame):
         global shutting_down
@@ -829,14 +859,42 @@ def main():
     if not connect():
         sys.exit(1)
 
+    _last_rx_ts = time.time()
     try:
         while not shutting_down:
-            sio.sleep(30)
-            try:
-                sio.emit('heartbeat', {'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ')},
-                         namespace='/agent')
-            except Exception:
-                pass
+            sio.sleep(IMBOT_HB_INTERVAL)
+            if shutting_down:
+                break
+            # 1) Send the application-level heartbeat. The server replies with
+            #    'heartbeat:ack', which _touch()es _last_rx_ts via on_heartbeat_ack.
+            if sio.connected:
+                try:
+                    sio.emit('heartbeat',
+                             {'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ')},
+                             namespace='/agent')
+                except Exception:
+                    pass
+            # 2) Verify liveness. emit() NEVER raises on a half-open/zombie link,
+            #    so the only reliable signal is whether the server answered us
+            #    recently. If nothing has arrived for IMBOT_STALE_AFTER seconds the
+            #    link is dead — force a clean reconnect (an active disconnect does
+            #    NOT auto-reconnect, so we re-run connect() ourselves).
+            silence = time.time() - _last_rx_ts
+            if sio.connected and silence > IMBOT_STALE_AFTER:
+                log.warning("No server activity for %ds — zombie/half-open link, "
+                            "forcing reconnect" % int(silence))
+                try:
+                    sio.disconnect()
+                except Exception:
+                    pass
+                sio.sleep(2)
+                if not shutting_down:
+                    connect()
+                    _last_rx_ts = time.time()
+            elif not sio.connected and not shutting_down:
+                log.warning("Socket not connected — reconnecting")
+                connect()
+                _last_rx_ts = time.time()
     except KeyboardInterrupt:
         pass
     log.info("Shutdown complete.")
