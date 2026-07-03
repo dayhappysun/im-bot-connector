@@ -40,7 +40,7 @@ import socketio
 IMBOT_URL = os.environ.get('IMBOT_URL', 'https://im-bot.net')
 INVITE_CODE = os.environ.get('INVITE_CODE', 'YOUR_AGENT_INVITE_CODE')
 IMBOT_MODEL = os.environ.get('IMBOT_MODEL', '')
-IMBOT_TOOLSETS = os.environ.get('IMBOT_TOOLSETS', '')  # empty = profile default
+IMBOT_TOOLSETS = os.environ.get('IMBOT_TOOLSETS', 'web,browser,terminal,file,code_execution,vision,memory,session_search,skills,todo,delegation')
 # IMBOT_TIMEOUT NO LONGER KILLS the run. It is the cadence (seconds) at which we
 # post a progress / "still working" update to the chat while a long task runs.
 # (Set it small, e.g. 60, for a once-a-minute heartbeat.)
@@ -137,6 +137,7 @@ sio = socketio.Client(
 # Liveness timestamp: refreshed by _touch() on ANY server->client event. The
 # heartbeat watchdog in main() treats a long silence here as a zombie link.
 _last_rx_ts = time.time()
+_last_loop_ts = 0  # updated by main loop; watchdog thread exits if this stalls
 agent_id = None
 known_rooms = set()
 shutting_down = False
@@ -147,6 +148,9 @@ _room_locks = {}
 _locks_guard = threading.Lock()
 
 _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
+
+# Match [CLARIFY]{...json...}[/CLARIFY] blocks in agent output
+_CLARIFY_RE = re.compile(r'\[CLARIFY:(\{.*?\})\]', re.DOTALL)
 
 # In-chat model-switch command patterns
 _MODEL_CMD_RES = [
@@ -190,6 +194,7 @@ def _room_lock(room_id):
 
 
 def build_system_preamble():
+    clarify_timeout = os.environ.get('IMBOT_CLARIFY_TIMEOUT', '1800')
     return (
         "[SYSTEM CONTEXT - read once] You are an AI agent chatting with a user "
         "through im-bot, a multi-agent instant-messaging app. This conversation "
@@ -197,6 +202,13 @@ def build_system_preamble():
         "keep full memory of it across turns. Be helpful, concise, and friendly. "
         "Your replies are sent as chat messages, so use natural language. "
         "Keep replies reasonably short.\n\n"
+        "CLARIFICATION: Do NOT use the built-in clarify tool — it is disabled. "
+        "When you need the user to pick from specific options, "
+        "output ONLY this format and NOTHING else after it:\n"
+        "[CLARIFY:{\"question\":\"<your question>\",\"choices\":[\"A\",\"B\"],\"timeout\":" + clarify_timeout + "}]\n"
+        "CRITICAL: After the [CLARIFY:...] line, STOP. Do NOT add any more text. "
+        "The user will see buttons and pick one. Their choice comes as the next message. "
+        "For open-ended questions without choices, just ask normally.\n\n"
         "The user's first message follows:\n"
     )
 
@@ -466,6 +478,24 @@ def _task_summary(content, attachments):
     return s if len(s) <= 24 else (s[:24] + '…')
 
 
+def _parse_clarify(text):
+    """Extract [CLARIFY]{...}[/CLARIFY] blocks from agent output.
+
+    Returns (clean_text, clarify_list) where clarify_list is a list of
+    {question, choices, timeout} dicts parsed from the output.
+    """
+    blocks = _CLARIFY_RE.findall(text or '')
+    if not blocks:
+        return text, []
+    clean = _CLARIFY_RE.sub('', text).strip()
+    parsed = []
+    for block in blocks:
+        try:
+            parsed.append(json.loads(block.strip()))
+        except (json.JSONDecodeError, Exception):
+            parsed.append({'question': block.strip(), 'choices': [], 'timeout': int(os.environ.get('IMBOT_CLARIFY_TIMEOUT', '1800'))})
+    return clean, parsed
+
 def call_agent(content, room_id, send_progress=None, task_id=None):
     """Generate a reply via the room's persistent agent session.
 
@@ -670,9 +700,28 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
         pass
     try:
         reply = call_agent(effective, room_id, send_progress, task_id)
-        sio.emit('message:send', {'roomId': room_id, 'content': reply, 'msgType': 'text'},
-                 namespace='/agent')
-        log.info("Replied to %s (%d chars)" % (sender_name, len(reply)))
+        clean_reply, clarifies = _parse_clarify(reply)
+        for ci, cq in enumerate(clarifies):
+            clarify_id = '%s-%d' % (task_id, ci)
+            try:
+                sio.emit('message:clarify', {
+                    'roomId': room_id,
+                    'clarifyId': clarify_id,
+                    'question': cq.get('question', ''),
+                    'choices': cq.get('choices', []),
+                    'timeout': cq.get('timeout', 120),
+                }, namespace='/agent')
+                log.info("Sent clarify #%d to room %s" % (ci, room_id))
+            except Exception as e:
+                log.warning("clarify emit failed: %s" % e)
+        # Only send remaining text if there were NO clarifies (normal reply).
+        # When clarifies were extracted, the agent's trailing text is just
+        # "END your response here" noise — suppress it.
+        if clean_reply and not clarifies:
+            sio.emit('message:send', {'roomId': room_id, 'content': clean_reply, 'msgType': 'text'},
+                     namespace='/agent')
+        log.info("Replied to %s (%d chars)%s" % (sender_name, len(clean_reply or ''),
+                 (' + %d clarify(s)' % len(clarifies)) if clarifies else ''))
     except Exception as e:
         log.error("Error generating reply: %s" % e)
         sio.emit('message:send', {'roomId': room_id, 'content': "Error: %s" % str(e)[:200],
@@ -816,6 +865,32 @@ def on_task_cancel(data):
     log.info("🛑 Cancel requested for task %s" % tid)
 
 
+@sio.on('clarify:response', namespace='/agent')
+def on_clarify_response(data):
+    """User answered a clarify — feed the answer as a new user message
+    to trigger a fresh agent turn with the answer as context."""
+    room_id = data.get('roomId')
+    answer = data.get('answer', '')
+    question = data.get('question', '')
+    expired = data.get('expired', False)
+
+    if not room_id:
+        return
+    if expired:
+        log.info("Clarify expired in room %s (question: %s)" % (room_id, question[:60]))
+        return
+
+    log.info("Clarify answered in room %s: %s → %s" % (room_id, question[:40], answer[:40]))
+    # Feed the answer as a synthetic user message so the agent picks up
+    # the conversation on its next turn with full context.
+    effective = "The user answered your clarification:\nQuestion: %s\nAnswer: %s\n\nContinue from where you left off." % (question, answer)
+    task_id = uuid.uuid4().hex[:12]
+    summary = "clarify: " + (answer[:20] or "answered")
+    threading.Thread(target=_run_turn,
+                     args=(room_id, effective, task_id, summary, 'User'),
+                     daemon=True).start()
+
+
 # -- Connection -------------------------------------
 def connect():
     max_retries = 10
@@ -844,8 +919,20 @@ def connect():
     return False
 
 
+def _internal_watchdog():
+    """Watchdog thread: if the main loop stalls (no iteration for 2× the heartbeat
+    interval), the process is hung — force exit so the external watchdog restarts us."""
+    WATCHDOG_GRACE = max(IMBOT_HB_INTERVAL * 3, 90)  # at least 90s grace
+    while not shutting_down:
+        time.sleep(IMBOT_HB_INTERVAL)
+        gap = time.time() - _last_loop_ts
+        if gap > WATCHDOG_GRACE:
+            log.critical("Main loop stalled for %ds — force-exiting so watchdog restarts us" % int(gap))
+            os._exit(1)
+
+
 def main():
-    global shutting_down, room_sessions, room_models, _last_rx_ts
+    global shutting_down, room_sessions, room_models, _last_rx_ts, _last_loop_ts
 
     def graceful_shutdown(signum, frame):
         global shutting_down
@@ -880,8 +967,13 @@ def main():
         sys.exit(1)
 
     _last_rx_ts = time.time()
+    _last_loop_ts = time.time()
+    # Start internal watchdog — if the main loop stalls (sio.sleep hung, etc.)
+    # this thread will force-exit so the external watchdog can restart us.
+    threading.Thread(target=_internal_watchdog, daemon=True).start()
     try:
         while not shutting_down:
+            _last_loop_ts = time.time()  # heartbeat for the internal watchdog
             sio.sleep(IMBOT_HB_INTERVAL)
             if shutting_down:
                 break
