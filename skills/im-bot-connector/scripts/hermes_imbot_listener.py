@@ -152,6 +152,46 @@ _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
 # Match [CLARIFY]{...json...}[/CLARIFY] blocks in agent output
 _CLARIFY_RE = re.compile(r'\[CLARIFY:(\{.*?\})\]', re.DOTALL)
 
+# Match MEDIA:/absolute/path in agent output — Hermes signals file delivery
+_MEDIA_RE = re.compile(r'MEDIA:(/[^\s\n]+)', re.IGNORECASE)
+
+# -- Helper functions --------------------------------
+import base64  # noqa: E402
+
+
+def _media_file(file_path):
+    """Read a local file, return (mime_type, base64_data, file_name) or (None, None, None)."""
+    abs_path = os.path.abspath(os.path.expanduser(file_path))
+    if not os.path.isfile(abs_path):
+        log.warning("MEDIA: file not found: %s" % abs_path)
+        return None, None, None
+    try:
+        import mimetypes
+        mime, _ = mimetypes.guess_type(abs_path)
+        mime = mime or 'application/octet-stream'
+        with open(abs_path, 'rb') as f:
+            data = base64.b64encode(f.read()).decode('ascii')
+        return mime, data, os.path.basename(abs_path)
+    except Exception as e:
+        log.warning("MEDIA: read error for %s: %s" % (abs_path, e))
+        return None, None, None
+
+
+def _parse_media(text, room_id):
+    """Extract MEDIA:/path references, read files as base64, return (clean_text, attachments).
+    Each attachment is {fileName, mimeType, data: base64_string}."""
+    matches = _MEDIA_RE.findall(text or '')
+    if not matches:
+        return text, []
+    clean = _MEDIA_RE.sub('', text).strip()
+    attachments = []
+    for file_path in matches:
+        mime, b64, name = _media_file(file_path.strip())
+        if b64:
+            log.info("MEDIA: encoded %s (%s, %d chars)" % (name, mime, len(b64)))
+            attachments.append({'fileName': name, 'mimeType': mime, 'data': b64})
+    return clean, attachments
+
 # In-chat model-switch command patterns
 _MODEL_CMD_RES = [
     re.compile(r'^/model\s*(?P<m>\S.*)?$', re.IGNORECASE),
@@ -700,6 +740,21 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
         pass
     try:
         reply = call_agent(effective, room_id, send_progress, task_id)
+        # 1) Parse MEDIA: references — upload files, get attachment objects
+        reply, attachments = _parse_media(reply, room_id)
+        for att in attachments:
+            try:
+                meta = json.dumps({'fileName': att['fileName'], 'mimeType': att['mimeType'], 'data': att['data']})
+                sio.emit('message:send', {
+                    'roomId': room_id,
+                    'content': '📎 ' + att.get('fileName', 'file'),
+                    'msgType': 'file',
+                    'metadata': meta,
+                }, namespace='/agent')
+                log.info("Sent file to room %s: %s (%s, %d chars)" % (room_id, att.get('fileName', '?'), att.get('mimeType', '?'), len(att.get('data', ''))))
+            except Exception as e:
+                log.warning("attachment emit failed: %s" % e)
+        # 2) Parse clarify blocks
         clean_reply, clarifies = _parse_clarify(reply)
         for ci, cq in enumerate(clarifies):
             clarify_id = '%s-%d' % (task_id, ci)
