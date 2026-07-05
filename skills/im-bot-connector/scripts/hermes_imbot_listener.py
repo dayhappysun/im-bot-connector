@@ -242,13 +242,14 @@ def build_system_preamble():
         "keep full memory of it across turns. Be helpful, concise, and friendly. "
         "Your replies are sent as chat messages, so use natural language. "
         "Keep replies reasonably short.\n\n"
-        "CLARIFICATION: Do NOT use the built-in clarify tool — it is disabled. "
-        "When you need the user to pick from specific options, "
-        "output ONLY this format and NOTHING else after it:\n"
+        "CLARIFICATION: Do NOT use the built-in clarify tool — it is disabled.\n"
+        "When you have a SUBSTANTIVE reply AND want to ask a follow-up question, "
+        "just ask naturally as part of your reply text (no special format needed).\n"
+        "Only use the [CLARIFY:{...}] format when the ENTIRE response is just a "
+        "clarification question with no other content:\n"
         "[CLARIFY:{\"question\":\"<your question>\",\"choices\":[\"A\",\"B\"],\"timeout\":" + clarify_timeout + "}]\n"
-        "CRITICAL: After the [CLARIFY:...] line, STOP. Do NOT add any more text. "
-        "The user will see buttons and pick one. Their choice comes as the next message. "
-        "For open-ended questions without choices, just ask normally.\n\n"
+        "CRITICAL: If you use [CLARIFY:{...}], output NOTHING else — no text before or after.\n"
+        "For open-ended questions without choices, always ask naturally.\n\n"
         "The user's first message follows:\n"
     )
 
@@ -260,25 +261,22 @@ def _strip_tool_blocks(text):
     lines = (text or '').split('\n')
     out = []
     i, n = 0, len(lines)
+    def _is_diff_line(l):
+        """Recognize any line that belongs to a git diff block."""
+        s = l.strip()
+        return (l[:1] in '+- \\' or l.strip() == ''
+                or l.startswith('@@') or '→' in l
+                or l.lstrip().startswith(('a/', 'b/'))
+                or s.startswith('diff --git') or s.startswith('index ')
+                or s.startswith('--- ') or s.startswith('+++ ')
+                or s == '\\ No newline at end of file')
     while i < n:
         line = lines[i]
         if '┊' in line:                       # tool-rendering gutter marker
             i += 1
-            # skip file header line(s):  a/path → b/path
-            while i < n and ('→' in lines[i] or lines[i].lstrip().startswith(('a/', 'b/'))):
+            # skip all diff-related lines until we hit non-diff content
+            while i < n and _is_diff_line(lines[i]):
                 i += 1
-            # skip diff hunks: @@ headers, then +/-/space (and blank) body lines
-            saw_hunk = False
-            while i < n:
-                l = lines[i]
-                if l.startswith('@@'):
-                    saw_hunk = True
-                    i += 1
-                    continue
-                if saw_hunk and (l[:1] in '+- ' or l.strip() == ''):
-                    i += 1
-                    continue
-                break
             continue
         out.append(line)
         i += 1
@@ -536,7 +534,7 @@ def _parse_clarify(text):
             parsed.append({'question': block.strip(), 'choices': [], 'timeout': int(os.environ.get('IMBOT_CLARIFY_TIMEOUT', '1800'))})
     return clean, parsed
 
-def call_agent(content, room_id, send_progress=None, task_id=None):
+def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=False):
     """Generate a reply via the room's persistent agent session.
 
     Streams real tool-execution progress to the chat while running, posts a
@@ -700,6 +698,11 @@ def call_agent(content, room_id, send_progress=None, task_id=None):
                 log.warning("Dropping stale session %s for room %s" % (existing_sid, room_id))
                 room_sessions.pop(room_id, None)
                 _save_json(SESSION_MAP_FILE, room_sessions)
+                # Auto-recover: retry with a fresh session (transparent to user)
+                if not _is_retry:
+                    if send_progress:
+                        send_progress("🔄 检测到会话过期，正在启动新会话…")
+                    return call_agent(content, room_id, send_progress, task_id, _is_retry=True)
             return "Sorry, I had trouble processing that. (%s)" % err_msg[:100]
 
         reply, parsed_sid = _parse_agent_output(stdout, stderr)
@@ -754,8 +757,14 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
                 log.info("Sent file to room %s: %s (%s, %d chars)" % (room_id, att.get('fileName', '?'), att.get('mimeType', '?'), len(att.get('data', ''))))
             except Exception as e:
                 log.warning("attachment emit failed: %s" % e)
-        # 2) Parse clarify blocks
+        # 2) Send clean reply text FIRST (always — even if clarifies follow).
+        # When the agent provides both a reply AND a follow-up question,
+        # the reply text appears before the clarify widget in the chat.
         clean_reply, clarifies = _parse_clarify(reply)
+        if clean_reply:
+            sio.emit('message:send', {'roomId': room_id, 'content': clean_reply, 'msgType': 'text'},
+                     namespace='/agent')
+        # 3) Send clarify blocks AFTER the reply text (standalone or follow-up).
         for ci, cq in enumerate(clarifies):
             clarify_id = '%s-%d' % (task_id, ci)
             try:
@@ -769,12 +778,14 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
                 log.info("Sent clarify #%d to room %s" % (ci, room_id))
             except Exception as e:
                 log.warning("clarify emit failed: %s" % e)
-        # Only send remaining text if there were NO clarifies (normal reply).
-        # When clarifies were extracted, the agent's trailing text is just
-        # "END your response here" noise — suppress it.
-        if clean_reply and not clarifies:
-            sio.emit('message:send', {'roomId': room_id, 'content': clean_reply, 'msgType': 'text'},
-                     namespace='/agent')
+        # When clarify exists but no reply text, the session has the OLD preamble
+        # (which tells agent "output ONLY [CLARIFY:{...}]"). Reset the session
+        # so the next turn gets the updated preamble with natural-language guidance.
+        if clarifies and not clean_reply:
+            old_sid = room_sessions.pop(room_id, None)
+            if old_sid:
+                _save_json(SESSION_MAP_FILE, room_sessions)
+                log.info("Dropped session %s for room %s (old preamble → will use new preamble next turn)" % (old_sid, room_id))
         log.info("Replied to %s (%d chars)%s" % (sender_name, len(clean_reply or ''),
                  (' + %d clarify(s)' % len(clarifies)) if clarifies else ''))
     except Exception as e:
