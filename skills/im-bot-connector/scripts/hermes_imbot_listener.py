@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Agent Listener for im-bot (v5 - sessions, attachments, model-switch)
-=====================================================================
+Agent Listener for im-bot (v5 — sessions, attachments, model-switch, interrupt)
+=============================================================================
 Persistent Socket.io connection to im-bot's /agent namespace. Responds via a
 real agent CLI - Hermes Agent OR OpenClaw (auto-detected, CLI-compatible).
 
@@ -13,6 +13,9 @@ FEATURES
   - In-chat model switching: a user can say "/model <name>" (or natural
     language). The listener PROBES the candidate model and only applies it
     if the probe succeeds, otherwise it rolls back to the previous model.
+  - Interrupt (插话): when a user sends a new message mid-turn, the current
+    turn is cancelled and all pending messages are merged into one combined
+    prompt for the next turn.
 
 Usage:
   python3 hermes_imbot_listener.py [--debug]
