@@ -147,6 +147,15 @@ room_models = {}       # room_id -> model override (set via in-chat command)
 _room_locks = {}
 _locks_guard = threading.Lock()
 
+# ── Interrupt (插话) support ──────────────────────
+# When a user sends a new message while an agent turn is running for the same
+# room, we cancel the current turn, queue the new message, then drain the queue
+# into one combined prompt and restart processing.
+_pending_msgs = {}     # room_id -> [(content, sender_name, attachments), ...]
+_room_turn = {}        # room_id -> {task_id, running: bool}
+_room_restart = {}     # room_id -> bool — signal to drain queue and restart
+_turn_guard = threading.Lock()
+
 _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
 
 # Match [CLARIFY]{...json...}[/CLARIFY] blocks in agent output
@@ -694,7 +703,7 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
         if proc.returncode != 0:
             err_msg = stderr.strip() if stderr else 'empty response'
             log.error("Agent exited %s: %s" % (proc.returncode, err_msg[:200]))
-            if existing_sid and 'session' in err_msg.lower():
+            if existing_sid and 'session not found' in err_msg.lower():
                 log.warning("Dropping stale session %s for room %s" % (existing_sid, room_id))
                 room_sessions.pop(room_id, None)
                 _save_json(SESSION_MAP_FILE, room_sessions)
@@ -801,6 +810,49 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
         with _procs_guard:
             _cancelled.discard(task_id)
 
+        # ── Drain-and-restart: if user interrupted with new messages ──
+        restart = False
+        with _turn_guard:
+            if _room_restart.get(room_id):
+                restart = True
+
+        if restart:
+            with _turn_guard:
+                pending = _pending_msgs.pop(room_id, [])
+                _room_restart.pop(room_id, None)
+
+            if pending:
+                # Build combined prompt from all queued messages
+                combined_parts = []
+                names = set()
+                # Include the original message that was interrupted too
+                if effective:
+                    combined_parts.append(effective)
+                    names.add(sender_name)
+                for eff, sname, _atts in pending:
+                    combined_parts.append(eff)
+                    names.add(sname)
+
+                combined = "\n\n---\n[INTERRUPT: The user sent additional message(s) while you were responding. Process ALL of the following together.]\n\n" + "\n\n---\n".join(combined_parts)
+                new_task_id = uuid.uuid4().hex[:12]
+                new_summary = "interrupt: " + ", ".join(sorted(names))
+
+                with _turn_guard:
+                    _room_turn[room_id] = {'task_id': new_task_id, 'running': True}
+
+                log.info("🔄 Drain-and-restart for room %s: %d pending msgs from %s"
+                         % (room_id, len(pending), ", ".join(sorted(names))))
+                # Recurse: start a new turn with the combined content
+                _run_turn(room_id, combined, new_task_id, new_summary,
+                          ", ".join(sorted(names)))
+                return  # The recursive call handles its own cleanup
+            else:
+                with _turn_guard:
+                    _room_turn.pop(room_id, None)
+        else:
+            with _turn_guard:
+                _room_turn.pop(room_id, None)
+
 
 # -- Socket.io Event Handlers -----------------------
 def _touch():
@@ -881,10 +933,37 @@ def on_message(msg):
             sio.emit('typing:stop', {'roomId': room_id}, namespace='/agent')
         return
 
-    # ── Normal agent turn — run in a worker thread so the socket read loop
-    #    stays free to receive task:cancel (and other rooms) mid-turn.
+    # ── Interrupt-aware agent turn ────────────────────
+    # If a turn is already running for this room, cancel it, queue this
+    # message (and any other pending ones), then restart with all queued
+    # messages merged into one combined prompt.
     effective = build_effective_content(content, attachments)
-    task_id = uuid.uuid4().hex[:12]
+
+    with _turn_guard:
+        turn = _room_turn.get(room_id)
+        if turn and turn.get('running'):
+            # Turn is running — cancel it and queue the new message
+            log.info("🔄 Interrupt: cancelling running turn for room %s, queuing message" % room_id)
+            _pending_msgs.setdefault(room_id, []).append(
+                (effective, sender_name, attachments))
+            _room_restart[room_id] = True
+            # Cancel the current task
+            tid = turn['task_id']
+            with _procs_guard:
+                _cancelled.add(tid)
+                proc = _running_procs.get(tid)
+            if proc:
+                try:
+                    proc.kill()
+                except Exception as e:
+                    log.debug("cancel kill failed: %s" % e)
+            return
+
+        # No turn running — mark as running and start a new one
+        task_id = uuid.uuid4().hex[:12]
+        _room_turn[room_id] = {'task_id': task_id, 'running': True}
+        _room_restart.pop(room_id, None)  # clear any stale restart flag
+
     summary = _task_summary(content, attachments)
     threading.Thread(target=_run_turn,
                      args=(room_id, effective, task_id, summary, sender_name),
