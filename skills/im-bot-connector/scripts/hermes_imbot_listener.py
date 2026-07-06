@@ -254,6 +254,11 @@ def build_system_preamble():
         "keep full memory of it across turns. Be helpful, concise, and friendly. "
         "Your replies are sent as chat messages, so use natural language. "
         "Keep replies reasonably short.\n\n"
+        "CONTENT SAFETY: You MUST NOT generate content that is sexually explicit, "
+        "depicts child exploitation (CSAM), promotes terrorism or mass violence, "
+        "encourages self-harm or suicide, contains hate speech, or provides "
+        "instructions for illegal activities. If asked, politely refuse. "
+        "Violating this policy will result in immediate disconnection.\n\n"
         "CLARIFICATION: Do NOT use the built-in clarify tool — it is disabled.\n"
         "When you have a SUBSTANTIVE reply AND want to ask a follow-up question, "
         "just ask naturally as part of your reply text (no special format needed).\n"
@@ -293,6 +298,38 @@ def _strip_tool_blocks(text):
         out.append(line)
         i += 1
     return '\n'.join(out).strip()
+
+
+# ── Agent output content filter ────────────────────
+# Multi-language sensitive keyword blacklist, mirrors server's sensitiveFilter.ts.
+# Scans agent output before delivery. Returns (blocked: bool, reason: str).
+_OUTPUT_BLOCKLIST = [
+    # CSAM
+    'child porn', 'childporn', 'lolita', 'pedo', 'preteen', 'underage',
+    'csam', '儿童色情', '幼女', '幼儿色情',
+    # Terror
+    'isis', 'al-qaeda', 'al qaeda', 'taliban', 'jihadist', 'martyrdom',
+    'isis视频', '恐怖组织', '圣战', 'داعش', 'القاعدة',
+    # Violence
+    'mass shooting', 'school shooter', 'genocide', 'ethnic cleansing',
+    '大规模枪击', '种族灭绝',
+    # Hate
+    'nigger', 'kike', 'faggot', 'holohoax',
+    # Self-harm
+    'kill yourself', 'kys', 'commit suicide', '自残', '自杀吧',
+]
+_OUTPUT_PATTERNS = [re.compile(re.escape(w), re.IGNORECASE) for w in _OUTPUT_BLOCKLIST]
+
+
+def _scan_output(text):
+    """Check agent output for blocked content. Returns (blocked, match_word)."""
+    if not text or len(text) < 2:
+        return False, ''
+    lower = text.lower()
+    for pat in _OUTPUT_PATTERNS:
+        if pat.search(lower):
+            return True, pat.pattern.replace('\\', '')
+    return False, ''
 
 
 def _parse_agent_output(stdout, stderr):
@@ -773,9 +810,19 @@ def _run_turn(room_id, effective, task_id, summary, sender_name):
         # When the agent provides both a reply AND a follow-up question,
         # the reply text appears before the clarify widget in the chat.
         clean_reply, clarifies = _parse_clarify(reply)
+        # ── Output content safety scan ──────────────
         if clean_reply:
-            sio.emit('message:send', {'roomId': room_id, 'content': clean_reply, 'msgType': 'text'},
-                     namespace='/agent')
+            blocked, hit = _scan_output(clean_reply)
+            if blocked:
+                log.warning("BLOCKED output for room %s: matched '%s'" % (room_id, hit))
+                sio.emit('message:send',
+                         {'roomId': room_id,
+                          'content': '⚠️ My response was blocked by content safety filters.',
+                          'msgType': 'text'},
+                         namespace='/agent')
+            else:
+                sio.emit('message:send', {'roomId': room_id, 'content': clean_reply, 'msgType': 'text'},
+                         namespace='/agent')
         # 3) Send clarify blocks AFTER the reply text (standalone or follow-up).
         for ci, cq in enumerate(clarifies):
             clarify_id = '%s-%d' % (task_id, ci)
