@@ -240,7 +240,7 @@ def _room_lock(room_id):
     with _locks_guard:
         lk = _room_locks.get(room_id)
         if lk is None:
-            lk = threading.Lock()
+            lk = threading.RLock()
             _room_locks[room_id] = lk
         return lk
 
@@ -754,11 +754,14 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                 log.warning("Dropping stale session %s for room %s" % (existing_sid, room_id))
                 room_sessions.pop(room_id, None)
                 _save_json(SESSION_MAP_FILE, room_sessions)
+                # Clear from server so reconnect doesn't restore it
+                _report_session_map(room_id, '')
                 # Auto-recover: retry with a fresh session (transparent to user)
                 if not _is_retry:
                     if send_progress:
                         send_progress("🔄 检测到会话过期，正在启动新会话…")
-                    return call_agent(content, room_id, send_progress, task_id, _is_retry=True)
+                    reply = call_agent(content, room_id, send_progress, task_id, _is_retry=True)
+                    return reply
             return "Sorry, I had trouble processing that. (%s)" % err_msg[:100]
 
         reply, parsed_sid = _parse_agent_output(stdout, stderr)
@@ -942,7 +945,7 @@ def on_welcome(data):
     if isinstance(server_sessions, dict) and server_sessions:
         changed = False
         for _rid, _sid in server_sessions.items():
-            if _sid and room_sessions.get(_rid) != _sid:
+            if _sid and _sid != '' and room_sessions.get(_rid) != _sid:
                 room_sessions[_rid] = _sid
                 changed = True
         if changed:
