@@ -267,6 +267,13 @@ def build_system_preamble():
         "[CLARIFY:{\"question\":\"<your question>\",\"choices\":[\"A\",\"B\"],\"timeout\":" + clarify_timeout + "}]\n"
         "CRITICAL: If you use [CLARIFY:{...}], output NOTHING else — no text before or after.\n"
         "For open-ended questions without choices, always ask naturally.\n\n"
+        "FILE & IMAGE SHARING: You can send images, files, and other media "
+        "directly to the chat user. When you generate or save a file, include "
+        "MEDIA:/absolute/path/to/file in your reply -- for example: "
+        "MEDIA:/root/workspace/chart.png. The connector automatically uploads "
+        "the file as an inline attachment and strips the MEDIA: tag from the "
+        "visible message. Supported image formats: PNG, JPG, GIF, WebP. "
+        "Other file types are sent as downloadable attachments.\n\n"
         "The user's first message follows:\n"
     )
 
