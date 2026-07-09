@@ -124,6 +124,51 @@ _running_procs = {}
 _cancelled = set()
 _procs_guard = threading.Lock()
 
+# ── Multi-agent guard state ─────────────────────────────────────────────────
+_ROOM_AGENT_COOLDOWN_S  = 3     # seconds — minimum gap between agent messages
+_ROOM_AGENT_STREAK_MAX  = 10    # consecutive agent msgs without human → pause
+_room_last_agent_ts = {}         # room_id -> timestamp of last agent message
+_room_agent_streak  = {}         # room_id -> int, consecutive agent message count
+_room_last_human_ts = {}         # room_id -> timestamp of last human message
+_guard_lock = threading.Lock()
+
+def _guard_check(room_id):
+    """Return True if message should be DROPPED (cooldown or gate triggered)."""
+    with _guard_lock:
+        now = time.time()
+        # Cooldown: at least N seconds between agent messages
+        last = _room_last_agent_ts.get(room_id, 0)
+        if now - last < _ROOM_AGENT_COOLDOWN_S:
+            log.debug("[%s] Guard: cooldown (%.1fs since last agent)" % (room_id[:12], now - last))
+            return True
+        # Human gate: if too many agent msgs without human, pause
+        streak = _room_agent_streak.get(room_id, 0)
+        last_human = _room_last_human_ts.get(room_id, 0)
+        if streak >= _ROOM_AGENT_STREAK_MAX and last_human < last:
+            log.warning("[%s] Guard: streak=%d >= %d, no human since streak start — pausing"
+                        % (room_id[:12], streak, _ROOM_AGENT_STREAK_MAX))
+            return True
+        return False
+
+def _guard_bump(room_id, is_human=False):
+    """Update counters after a message passes guard."""
+    with _guard_lock:
+        now = time.time()
+        if is_human:
+            _room_agent_streak[room_id] = 0
+            _room_last_human_ts[room_id] = now
+        else:
+            _room_agent_streak[room_id] = _room_agent_streak.get(room_id, 0) + 1
+            _room_last_agent_ts[room_id] = now
+
+def _guard_reset(room_id):
+    """Reset guard state for a room (e.g. on session:reset)."""
+    with _guard_lock:
+        _room_last_agent_ts.pop(room_id, None)
+        _room_agent_streak.pop(room_id, None)
+        _room_last_human_ts.pop(room_id, None)
+
+
 _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
 _CLARIFY_RE    = re.compile(r'\[CLARIFY:(\{.*?\})\]', re.DOTALL)
 _MEDIA_RE      = re.compile(r'MEDIA:(/[^\s\n]+)', re.IGNORECASE)
@@ -178,6 +223,15 @@ def build_system_preamble():
         "the file as an inline attachment and strips the MEDIA: tag from the "
         "visible message. Supported image formats: PNG, JPG, GIF, WebP, SVG. "
         "Other file types are sent as downloadable attachments.\n\n"
+        "CONVERSATION CONTROL: This room may contain multiple AI agents.\n"
+        "1. Do NOT send social-closing messages (no \"OK\", \"Got it\", \"Done\",\n"
+        "   \"Noted\", \"You're welcome\" in any language). When a task is\n"
+        "   complete, just stop — no need to acknowledge.\n"
+        "2. Only reply when there is a real question, request, or new\n"
+        "   information to add. If nothing needs to be said, say nothing.\n"
+        "3. If another agent already completed the task, do not echo,\n"
+        "   compliment, or add a +1. Just stop.\n"
+        "4. Be concise. Long acknowledgements waste everyone's tokens.\n\n"
         "The user's first message follows:\n"
     )
 
@@ -737,11 +791,13 @@ async def async_main():
         if shutting_down:
             return
 
-        # Ignore messages from agents (including our own echoes)
-        sender_type = msg.get('senderType', 'user')
-        if sender_type == 'agent':
+        # Ignore our own echoes (not other agents)
+        my_id = agent_id
+        sender_id = msg.get('senderId', '')
+        if my_id and sender_id == my_id:
             return
 
+        sender_type = msg.get('senderType', 'user')
         content = msg.get('content', '') or ''
         sender_name = msg.get('senderName', 'Unknown')
         room_id = msg.get('roomId')
@@ -749,6 +805,16 @@ async def async_main():
         attachments = extract_attachments(msg.get('metadata'))
         if not content.strip() and not attachments:
             return
+
+        # ── Multi-agent guard ───────────────────────────────────────────
+        is_human = (sender_type != 'agent')
+        if not is_human:
+            # Agent message: check cooldown + streak gate
+            if _guard_check(room_id):
+                log.info("[%s] Guard: dropped agent message from %s"
+                         % (room_id[:12], sender_name))
+                return
+        _guard_bump(room_id, is_human=is_human)
 
         log.info("[%s] Message from %s: %s%s"
                  % (room_id[:12] if room_id else '?', sender_name, content[:80],
@@ -836,6 +902,29 @@ async def async_main():
     @sio.on('error', namespace='/agent')
     async def on_error(data):
         log.error("Server error: %s" % data)
+
+    @sio.on('session:reset', namespace='/agent')
+    async def on_session_reset(data):
+        """Server broadcasts session:reset when user clicks New Session button.
+        Clears this room's session so next message starts fresh with preamble."""
+        room_id = data.get('roomId') if isinstance(data, dict) else data
+        if not room_id:
+            return
+        old_sid = room_sessions.pop(room_id, None)
+        if old_sid:
+            _save_json(SESSION_MAP_FILE, room_sessions)
+            log.info("[%s] Session reset — dropped session %s" % (room_id[:12], old_sid))
+        else:
+            log.info("[%s] Session reset — no active session to drop" % room_id[:12])
+        _guard_reset(room_id)
+        with _turn_guard:
+            _room_turn.pop(room_id, None)
+            _room_restart.pop(room_id, None)
+        # Ack back so server knows we processed it
+        try:
+            await sio.emit('session:reset:ack', {'roomId': room_id}, namespace='/agent')
+        except Exception:
+            pass
 
     # ── Connect ─────────────────────────────────────────────────────────────
     try:
