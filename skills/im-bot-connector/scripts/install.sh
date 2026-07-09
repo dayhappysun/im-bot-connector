@@ -119,13 +119,21 @@ cp "$LISTENER_SRC" "$LISTENER_DST"
 chmod +x "$LISTENER_DST"
 echo "   ✅ Installed to $LISTENER_DST"
 
-# ── Step 3: Install service (systemd or crontab) ──────────
+# ── Step 3: Install service ──────────────────────────────
+# Priority chain: systemd > supervisord > cron+flock
 echo "🔧 [3/4] Installing service..."
 
 SERVICE_NAME="hermes-imbot"
+SUPERVISOR_AVAILABLE=false
 
+if command -v supervisorctl &> /dev/null; then
+  SUPERVISOR_AVAILABLE=true
+elif [ -d /etc/supervisor/conf.d ] || [ -d /etc/supervisord.d ]; then
+  SUPERVISOR_AVAILABLE=true
+fi
+
+# ── Tier 1: systemd (bare metal / VM) ─────────────────────
 if command -v systemctl &> /dev/null && systemctl --user list-units &> /dev/null 2>&1; then
-  # systemd user service
   mkdir -p ~/.config/systemd/user
 
   cat > ~/.config/systemd/user/${SERVICE_NAME}.service << UNIT
@@ -151,24 +159,60 @@ UNIT
   systemctl --user enable "$SERVICE_NAME"
   echo "   ✅ systemd user service installed ($SERVICE_NAME)"
 
-  # Stop old instance if running
   systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
-  # Start fresh
-  systemctl --user restart "$SERVICE_NAME" || echo "   ⚠️ Could not start service (try: systemctl --user start $SERVICE_NAME)"
+  systemctl --user restart "$SERVICE_NAME" || echo "   ⚠️ Could not start (try: systemctl --user start $SERVICE_NAME)"
 
+# ── Tier 2: supervisord (Docker / container) ──────────────
+elif $SUPERVISOR_AVAILABLE; then
+  # Find conf.d directory
+  if [ -d /etc/supervisor/conf.d ]; then
+    CONF_DIR=/etc/supervisor/conf.d
+  elif [ -d /etc/supervisord.d ]; then
+    CONF_DIR=/etc/supervisord.d
+  else
+    mkdir -p /etc/supervisor/conf.d
+    CONF_DIR=/etc/supervisor/conf.d
+  fi
+
+  cat > "${CONF_DIR}/${SERVICE_NAME}.conf" << SUPERVISOR
+[program:${SERVICE_NAME}]
+command=python3 ${LISTENER_DST}
+autorestart=true
+startsecs=5
+stopwaitsecs=10
+redirect_stderr=true
+stdout_logfile=/tmp/${SERVICE_NAME}.log
+environment=IMBOT_BACKEND="${IMBOT_BACKEND}",IMBOT_MODEL="${HERMES_MODEL}",IMBOT_TIMEOUT="180"
+SUPERVISOR
+
+  # Reload and start
+  supervisorctl reread 2>/dev/null || true
+  supervisorctl update 2>/dev/null || true
+  supervisorctl start "$SERVICE_NAME" 2>/dev/null || true
+  echo "   ✅ supervisord config installed (${CONF_DIR}/${SERVICE_NAME}.conf)"
+
+# ── Tier 3: cron + flock watchdog (fallback) ──────────────
 else
-  # Fallback: crontab @reboot
-  echo "   ⚠️ systemd not available — using crontab @reboot fallback"
+  echo "   ⚠️ No systemd or supervisord — using cron + flock watchdog fallback"
 
-  crontab -l 2>/dev/null | grep -v "$LISTENER_DST" > /tmp/hermes_cron_tmp || true
-  echo "@reboot sleep 30 && $LISTENER_DST >> /tmp/hermes_imbot.log 2>&1" >> /tmp/hermes_cron_tmp
+  # Install watchdog script
+  WATCHDOG_SRC="$SKILL_DIR/scripts/imbot_watchdog.sh"
+  WATCHDOG_DST="$HOME/.local/bin/hermes-imbot-watchdog"
+  if [ -f "$WATCHDOG_SRC" ]; then
+    cp "$WATCHDOG_SRC" "$WATCHDOG_DST"
+    chmod +x "$WATCHDOG_DST"
+  fi
+
+  # Add cron entry (every 2 minutes)
+  crontab -l 2>/dev/null | grep -v "$WATCHDOG_DST" > /tmp/hermes_cron_tmp || true
+  echo "*/2 * * * * $WATCHDOG_DST >> /tmp/${SERVICE_NAME}-watchdog.log 2>&1" >> /tmp/hermes_cron_tmp
   crontab /tmp/hermes_cron_tmp
   rm /tmp/hermes_cron_tmp
-  echo "   ✅ Added to crontab @reboot"
+  echo "   ✅ Cron watchdog installed (every 2 min)"
 
   # Start now
-  nohup "$LISTENER_DST" >> /tmp/hermes_imbot.log 2>&1 &
-  echo "   ✅ Started in background (PID $!)"
+  "$WATCHDOG_DST" 2>&1 &
+  echo "   ✅ Watchdog triggered"
 fi
 
 # ── Step 4: Verify ────────────────────────────────────────
