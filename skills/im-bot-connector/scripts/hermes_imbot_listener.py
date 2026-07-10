@@ -104,6 +104,7 @@ log = logging.getLogger('imbot-agent')
 # ── Global state ────────────────────────────────────────────────────────────
 sio = None
 agent_id = None
+agent_name = None    # set from welcome event, used for @mention matching
 known_rooms = set()
 shutting_down = False
 last_rx_ts = time.time()
@@ -167,6 +168,28 @@ def _guard_reset(room_id):
         _room_last_agent_ts.pop(room_id, None)
         _room_agent_streak.pop(room_id, None)
         _room_last_human_ts.pop(room_id, None)
+
+
+# ── Background message logging ─────────────────────────────────────────────
+_ROOM_LOG_DIR = os.path.expanduser('~/.hermes/imbot_room_logs')
+
+def _log_background(room_id, content, sender_name, reason='observed'):
+    """Log a message the agent observed but didn't respond to.
+    Appends JSONL to ~/.hermes/imbot_room_logs/<room_id>.jsonl
+    Kept for context injection when the agent IS later addressed."""
+    try:
+        os.makedirs(_ROOM_LOG_DIR, exist_ok=True)
+        log_path = os.path.join(_ROOM_LOG_DIR, '%s.jsonl' % room_id)
+        entry = json.dumps({
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'sender': sender_name,
+            'content': content[:2000],
+            'reason': reason,
+        })
+        with open(log_path, 'a') as f:
+            f.write(entry + '\n')
+    except Exception:
+        pass  # logging is best-effort
 
 
 _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
@@ -767,8 +790,9 @@ async def async_main():
 
     @sio.on('welcome', namespace='/agent')
     async def on_welcome(data):
-        global agent_id, last_rx_ts
+        global agent_id, agent_name, last_rx_ts
         agent_id = data.get('agentId')
+        agent_name = data.get('agentName') or data.get('name') or ''
         rooms = data.get('rooms', [])
         known_rooms = set(rooms)
         # Restore server-side session map
@@ -819,6 +843,24 @@ async def async_main():
         log.info("[%s] Message from %s: %s%s"
                  % (room_id[:12] if room_id else '?', sender_name, content[:80],
                     (" [+%d attachment(s)]" % len(attachments)) if attachments else ""))
+
+        # ── @mention routing ─────────────────────────────────────────
+        # - Message has mentions AND we're mentioned → process normally
+        # - Message has mentions AND we're NOT mentioned → skip, log bg
+        # - Message has NO mentions (broadcast) → process normally
+        mentions = msg.get('mentions') or []
+        if mentions:
+            my_name = agent_name or agent_id or ''
+            mentioned_ids = {m.get('agentId', '') for m in mentions if isinstance(m, dict)}
+            mentioned_names = {m.get('agentName', '').lower() for m in mentions if isinstance(m, dict)}
+            was_mentioned = (agent_id in mentioned_ids) or \
+                            (any(my_name.lower() in n or n in my_name.lower() for n in mentioned_names))
+            if not was_mentioned:
+                _log_background(room_id, content, sender_name, 'not-mentioned')
+                return
+
+        # Log all messages for background context
+        _log_background(room_id, content, sender_name, 'observed')
 
         # In-chat model switch
         target = parse_model_command(content)
