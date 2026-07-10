@@ -133,6 +133,59 @@ _room_agent_streak  = {}         # room_id -> int, consecutive agent message cou
 _room_last_human_ts = {}         # room_id -> timestamp of last human message
 _guard_lock = threading.Lock()
 
+# ── Room member cache ────────────────────────────────────────────────────────
+_room_members_cache = {}  # room_id -> list of {userId, username, agentId, agentName, nickname}
+_room_members_guard = threading.Lock()
+
+def get_room_members(room_id):
+    """Query the server for room participants. Results are cached for 60s."""
+    with _room_members_guard:
+        cached = _room_members_cache.get(room_id)
+        if cached and time.time() - cached['ts'] < 60:
+            return cached['members']
+
+    # Call the async sio.emit_with_ack from a sync context via threading
+    result = {'members': None}
+    event = threading.Event()
+
+    def _do_query():
+        try:
+            loop = asyncio.new_event_loop()
+            async def _emit():
+                try:
+                    resp = await sio.call('room:members', {'roomId': room_id}, namespace='/agent', timeout=10)
+                    result['members'] = resp.get('members') if isinstance(resp, dict) else None
+                except Exception:
+                    pass
+                event.set()
+            loop.run_until_complete(_emit())
+        except Exception:
+            event.set()
+
+    t = threading.Thread(target=_do_query, daemon=True)
+    t.start()
+    event.wait(timeout=12)
+
+    members = result['members'] or []
+    with _room_members_guard:
+        _room_members_cache[room_id] = {'ts': time.time(), 'members': members}
+    return members
+
+
+def build_members_context(room_id):
+    """Build a text block listing room members for injection into agent context."""
+    members = get_room_members(room_id)
+    if not members:
+        return ''
+    lines = ['[ROOM MEMBERS]']
+    for m in members:
+        if m.get('agentId'):
+            lines.append('- 🤖 @%s (agent)' % (m.get('agentName') or m.get('agentId')))
+        else:
+            name = m.get('nickname') or m.get('username') or m.get('userId', '')
+            lines.append('- 👤 %s' % name)
+    return '\n'.join(lines) + '\n\n'
+
 def _guard_check(room_id):
     """Return True if message should be DROPPED (cooldown or gate triggered)."""
     with _guard_lock:
@@ -658,6 +711,11 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
         pass
 
     try:
+        # Inject room members context so agent knows who to @mention
+        members_ctx = build_members_context(room_id)
+        if members_ctx:
+            effective = members_ctx + effective
+
         reply = await asyncio.get_event_loop().run_in_executor(
             None, call_agent, effective, room_id, send_progress, task_id)
 
