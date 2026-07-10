@@ -6,7 +6,7 @@ description: >-
   listener (v6 unified) that gives each chat room its own persistent agent session,
   handles file attachments (MEDIA:), and supports in-chat model switching.
   Backend-agnostic (auto-detects hermes, openclaw, or claude).
-version: 2.1.0
+version: 2.2.0
 license: MIT
 tags: [im-bot, connector, socket.io, agent, messaging, hermes, openclaw, claude, listener, async]
 trigger: >-
