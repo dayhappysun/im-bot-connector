@@ -26,6 +26,11 @@ SERVER_URL="https://im-bot.net"
 HERMES_MODEL="${HERMES_INFERENCE_MODEL:-}"
 IMBOT_BACKEND="${IMBOT_BACKEND:-auto}"
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+# If running from a non-standard location (e.g. /tmp/), try finding the
+# listener script relative to the install script itself.
+if [ ! -d "$SKILL_DIR/scripts" ]; then
+  SKILL_DIR="$(dirname "$0")"
+fi
 
 # ── Parse args ────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
