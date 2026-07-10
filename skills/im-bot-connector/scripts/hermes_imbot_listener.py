@@ -254,7 +254,10 @@ def build_system_preamble():
         "   information to add. If nothing needs to be said, say nothing.\n"
         "3. If another agent already completed the task, do not echo,\n"
         "   compliment, or add a +1. Just stop.\n"
-        "4. Be concise. Long acknowledgements waste everyone's tokens.\n\n"
+        "4. Be concise. Long acknowledgements waste everyone's tokens.\n"
+        "5. Your replies are NOT automatically visible to other agents.\n"
+        "   To address another agent, use @AgentName in your message.\n"
+        "   Without @, other agents will not see your reply.\n\n"
         "The user's first message follows:\n"
     )
 
@@ -845,22 +848,39 @@ async def async_main():
                     (" [+%d attachment(s)]" % len(attachments)) if attachments else ""))
 
         # ── @mention routing ─────────────────────────────────────────
-        # - Message has mentions AND we're mentioned → process normally
-        # - Message has mentions AND we're NOT mentioned → skip, log bg
-        # - Message has NO mentions (broadcast) → process normally
+        # - Human message → always process (broadcast)
+        # - Agent message + @us → process
+        # - Agent message + no @ → skip (prevents ping-pong loops)
         mentions = msg.get('mentions') or []
+        was_mentioned = False
         if mentions:
             my_name = agent_name or agent_id or ''
             mentioned_ids = {m.get('agentId', '') for m in mentions if isinstance(m, dict)}
             mentioned_names = {m.get('agentName', '').lower() for m in mentions if isinstance(m, dict)}
             was_mentioned = (agent_id in mentioned_ids) or \
                             (any(my_name.lower() in n or n in my_name.lower() for n in mentioned_names))
+
+        if sender_type == 'agent':
             if not was_mentioned:
+                # Agent message not directed at us — skip entirely.
+                # No background log either (would pollute context).
+                return
+            # Agent @@mentioned us — process, but don't log to background
+            # (agent-to-agent context isn't useful for human conversations)
+        else:
+            # Human message
+            if mentions and not was_mentioned:
+                # Human @someone-else — skip, but log for context
                 _log_background(room_id, content, sender_name, 'not-mentioned')
                 return
+            # Human broadcast or @us — process and log
+            _log_background(room_id, content, sender_name, 'observed')
 
-        # Log all messages for background context
-        _log_background(room_id, content, sender_name, 'observed')
+        # ── System message filter ──────────────────────────────────
+        # Skip known system/cancel messages that agents shouldn't respond to
+        _SYSTEM_PREFIXES = ('🛑', '⚠️', '🔄')
+        if any(content.strip().startswith(p) for p in _SYSTEM_PREFIXES):
+            return
 
         # In-chat model switch
         target = parse_model_command(content)
