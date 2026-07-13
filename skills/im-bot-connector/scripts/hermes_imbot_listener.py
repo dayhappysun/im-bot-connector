@@ -42,7 +42,7 @@ IMBOT_HARD_TIMEOUT = int(os.environ.get('IMBOT_HARD_TIMEOUT', '0')) # 0=unlimite
 IMBOT_SOURCE    = os.environ.get('IMBOT_SOURCE',    'imbot')
 IMBOT_HB_INTERVAL  = int(os.environ.get('IMBOT_HB_INTERVAL', '25'))
 IMBOT_STALE_AFTER  = int(os.environ.get('IMBOT_STALE_AFTER', '120'))
-IMBOT_AGENT_TIMEOUT = int(os.environ.get('IMBOT_AGENT_TIMEOUT', '300'))
+IMBOT_AGENT_TIMEOUT = int(os.environ.get('IMBOT_AGENT_TIMEOUT', '3600'))
 AGENT_LOG_FILE  = os.path.expanduser(
     os.environ.get('IMBOT_AGENT_LOG', '~/.hermes/logs/agent.log'))
 
@@ -104,7 +104,6 @@ log = logging.getLogger('imbot-agent')
 # ── Global state ────────────────────────────────────────────────────────────
 sio = None
 agent_id = None
-agent_name = None    # set from welcome event, used for @mention matching
 known_rooms = set()
 shutting_down = False
 last_rx_ts = time.time()
@@ -124,126 +123,6 @@ _turn_guard = threading.Lock()
 _running_procs = {}
 _cancelled = set()
 _procs_guard = threading.Lock()
-
-# ── Multi-agent guard state ─────────────────────────────────────────────────
-_ROOM_AGENT_COOLDOWN_S  = 3     # seconds — minimum gap between agent messages
-_ROOM_AGENT_STREAK_MAX  = 10    # consecutive agent msgs without human → pause
-_room_last_agent_ts = {}         # room_id -> timestamp of last agent message
-_room_agent_streak  = {}         # room_id -> int, consecutive agent message count
-_room_last_human_ts = {}         # room_id -> timestamp of last human message
-_guard_lock = threading.Lock()
-
-# ── Room member cache ────────────────────────────────────────────────────────
-_room_members_cache = {}  # room_id -> list of {userId, username, agentId, agentName, nickname}
-_room_members_guard = threading.Lock()
-
-def get_room_members(room_id):
-    """Query the server for room participants. Results are cached for 60s."""
-    with _room_members_guard:
-        cached = _room_members_cache.get(room_id)
-        if cached and time.time() - cached['ts'] < 60:
-            return cached['members']
-
-    # Call the async sio.emit_with_ack from a sync context via threading
-    result = {'members': None}
-    event = threading.Event()
-
-    def _do_query():
-        try:
-            loop = asyncio.new_event_loop()
-            async def _emit():
-                try:
-                    resp = await sio.call('room:members', {'roomId': room_id}, namespace='/agent', timeout=10)
-                    result['members'] = resp.get('members') if isinstance(resp, dict) else None
-                except Exception:
-                    pass
-                event.set()
-            loop.run_until_complete(_emit())
-        except Exception:
-            event.set()
-
-    t = threading.Thread(target=_do_query, daemon=True)
-    t.start()
-    event.wait(timeout=12)
-
-    members = result['members'] or []
-    with _room_members_guard:
-        _room_members_cache[room_id] = {'ts': time.time(), 'members': members}
-    return members
-
-
-def build_members_context(room_id):
-    """Build a text block listing room members for injection into agent context."""
-    members = get_room_members(room_id)
-    if not members:
-        return ''
-    lines = ['[ROOM MEMBERS]']
-    for m in members:
-        if m.get('agentId'):
-            lines.append('- 🤖 @%s (agent)' % (m.get('agentName') or m.get('agentId')))
-        else:
-            name = m.get('nickname') or m.get('username') or m.get('userId', '')
-            lines.append('- 👤 %s' % name)
-    return '\n'.join(lines) + '\n\n'
-
-def _guard_check(room_id):
-    """Return True if message should be DROPPED (cooldown or gate triggered)."""
-    with _guard_lock:
-        now = time.time()
-        # Cooldown: at least N seconds between agent messages
-        last = _room_last_agent_ts.get(room_id, 0)
-        if now - last < _ROOM_AGENT_COOLDOWN_S:
-            log.debug("[%s] Guard: cooldown (%.1fs since last agent)" % (room_id[:12], now - last))
-            return True
-        # Human gate: if too many agent msgs without human, pause
-        streak = _room_agent_streak.get(room_id, 0)
-        last_human = _room_last_human_ts.get(room_id, 0)
-        if streak >= _ROOM_AGENT_STREAK_MAX and last_human < last:
-            log.warning("[%s] Guard: streak=%d >= %d, no human since streak start — pausing"
-                        % (room_id[:12], streak, _ROOM_AGENT_STREAK_MAX))
-            return True
-        return False
-
-def _guard_bump(room_id, is_human=False):
-    """Update counters after a message passes guard."""
-    with _guard_lock:
-        now = time.time()
-        if is_human:
-            _room_agent_streak[room_id] = 0
-            _room_last_human_ts[room_id] = now
-        else:
-            _room_agent_streak[room_id] = _room_agent_streak.get(room_id, 0) + 1
-            _room_last_agent_ts[room_id] = now
-
-def _guard_reset(room_id):
-    """Reset guard state for a room (e.g. on session:reset)."""
-    with _guard_lock:
-        _room_last_agent_ts.pop(room_id, None)
-        _room_agent_streak.pop(room_id, None)
-        _room_last_human_ts.pop(room_id, None)
-
-
-# ── Background message logging ─────────────────────────────────────────────
-_ROOM_LOG_DIR = os.path.expanduser('~/.hermes/imbot_room_logs')
-
-def _log_background(room_id, content, sender_name, reason='observed'):
-    """Log a message the agent observed but didn't respond to.
-    Appends JSONL to ~/.hermes/imbot_room_logs/<room_id>.jsonl
-    Kept for context injection when the agent IS later addressed."""
-    try:
-        os.makedirs(_ROOM_LOG_DIR, exist_ok=True)
-        log_path = os.path.join(_ROOM_LOG_DIR, '%s.jsonl' % room_id)
-        entry = json.dumps({
-            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            'sender': sender_name,
-            'content': content[:2000],
-            'reason': reason,
-        })
-        with open(log_path, 'a') as f:
-            f.write(entry + '\n')
-    except Exception:
-        pass  # logging is best-effort
-
 
 _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
 _CLARIFY_RE    = re.compile(r'\[CLARIFY:(\{.*?\})\]', re.DOTALL)
@@ -299,18 +178,6 @@ def build_system_preamble():
         "the file as an inline attachment and strips the MEDIA: tag from the "
         "visible message. Supported image formats: PNG, JPG, GIF, WebP, SVG. "
         "Other file types are sent as downloadable attachments.\n\n"
-        "CONVERSATION CONTROL: This room may contain multiple AI agents.\n"
-        "1. Do NOT send social-closing messages (no \"OK\", \"Got it\", \"Done\",\n"
-        "   \"Noted\", \"You're welcome\" in any language). When a task is\n"
-        "   complete, just stop — no need to acknowledge.\n"
-        "2. Only reply when there is a real question, request, or new\n"
-        "   information to add. If nothing needs to be said, say nothing.\n"
-        "3. If another agent already completed the task, do not echo,\n"
-        "   compliment, or add a +1. Just stop.\n"
-        "4. Be concise. Long acknowledgements waste everyone's tokens.\n"
-        "5. Your replies are NOT automatically visible to other agents.\n"
-        "   To address another agent, use @AgentName in your message.\n"
-        "   Without @, other agents will not see your reply.\n\n"
         "The user's first message follows:\n"
     )
 
@@ -711,11 +578,6 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
         pass
 
     try:
-        # Inject room members context so agent knows who to @mention
-        members_ctx = build_members_context(room_id)
-        if members_ctx:
-            effective = members_ctx + effective
-
         reply = await asyncio.get_event_loop().run_in_executor(
             None, call_agent, effective, room_id, send_progress, task_id)
 
@@ -851,9 +713,8 @@ async def async_main():
 
     @sio.on('welcome', namespace='/agent')
     async def on_welcome(data):
-        global agent_id, agent_name, last_rx_ts
+        global agent_id, last_rx_ts
         agent_id = data.get('agentId')
-        agent_name = data.get('agentName') or data.get('name') or ''
         rooms = data.get('rooms', [])
         known_rooms = set(rooms)
         # Restore server-side session map
@@ -876,13 +737,11 @@ async def async_main():
         if shutting_down:
             return
 
-        # Ignore our own echoes (not other agents)
-        my_id = agent_id
-        sender_id = msg.get('senderId', '')
-        if my_id and sender_id == my_id:
+        # Ignore messages from agents (including our own echoes)
+        sender_type = msg.get('senderType', 'user')
+        if sender_type == 'agent':
             return
 
-        sender_type = msg.get('senderType', 'user')
         content = msg.get('content', '') or ''
         sender_name = msg.get('senderName', 'Unknown')
         room_id = msg.get('roomId')
@@ -891,54 +750,9 @@ async def async_main():
         if not content.strip() and not attachments:
             return
 
-        # ── Multi-agent guard ───────────────────────────────────────────
-        is_human = (sender_type != 'agent')
-        if not is_human:
-            # Agent message: check cooldown + streak gate
-            if _guard_check(room_id):
-                log.info("[%s] Guard: dropped agent message from %s"
-                         % (room_id[:12], sender_name))
-                return
-        _guard_bump(room_id, is_human=is_human)
-
         log.info("[%s] Message from %s: %s%s"
                  % (room_id[:12] if room_id else '?', sender_name, content[:80],
                     (" [+%d attachment(s)]" % len(attachments)) if attachments else ""))
-
-        # ── @mention routing ─────────────────────────────────────────
-        # - Human message → always process (broadcast)
-        # - Agent message + @us → process
-        # - Agent message + no @ → skip (prevents ping-pong loops)
-        mentions = msg.get('mentions') or []
-        was_mentioned = False
-        if mentions:
-            my_name = agent_name or agent_id or ''
-            mentioned_ids = {m.get('agentId', '') for m in mentions if isinstance(m, dict)}
-            mentioned_names = {m.get('agentName', '').lower() for m in mentions if isinstance(m, dict)}
-            was_mentioned = (agent_id in mentioned_ids) or \
-                            (any(my_name.lower() in n or n in my_name.lower() for n in mentioned_names))
-
-        if sender_type == 'agent':
-            if not was_mentioned:
-                # Agent message not directed at us — skip entirely.
-                # No background log either (would pollute context).
-                return
-            # Agent @@mentioned us — process, but don't log to background
-            # (agent-to-agent context isn't useful for human conversations)
-        else:
-            # Human message
-            if mentions and not was_mentioned:
-                # Human @someone-else — skip, but log for context
-                _log_background(room_id, content, sender_name, 'not-mentioned')
-                return
-            # Human broadcast or @us — process and log
-            _log_background(room_id, content, sender_name, 'observed')
-
-        # ── System message filter ──────────────────────────────────
-        # Skip known system/cancel messages that agents shouldn't respond to
-        _SYSTEM_PREFIXES = ('🛑', '⚠️', '🔄')
-        if any(content.strip().startswith(p) for p in _SYSTEM_PREFIXES):
-            return
 
         # In-chat model switch
         target = parse_model_command(content)
@@ -1022,29 +836,6 @@ async def async_main():
     @sio.on('error', namespace='/agent')
     async def on_error(data):
         log.error("Server error: %s" % data)
-
-    @sio.on('session:reset', namespace='/agent')
-    async def on_session_reset(data):
-        """Server broadcasts session:reset when user clicks New Session button.
-        Clears this room's session so next message starts fresh with preamble."""
-        room_id = data.get('roomId') if isinstance(data, dict) else data
-        if not room_id:
-            return
-        old_sid = room_sessions.pop(room_id, None)
-        if old_sid:
-            _save_json(SESSION_MAP_FILE, room_sessions)
-            log.info("[%s] Session reset — dropped session %s" % (room_id[:12], old_sid))
-        else:
-            log.info("[%s] Session reset — no active session to drop" % room_id[:12])
-        _guard_reset(room_id)
-        with _turn_guard:
-            _room_turn.pop(room_id, None)
-            _room_restart.pop(room_id, None)
-        # Ack back so server knows we processed it
-        try:
-            await sio.emit('session:reset:ack', {'roomId': room_id}, namespace='/agent')
-        except Exception:
-            pass
 
     # ── Connect ─────────────────────────────────────────────────────────────
     try:
