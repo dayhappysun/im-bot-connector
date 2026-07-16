@@ -423,11 +423,38 @@ def _parse_agent_output(stdout, stderr):
             session_id = m.group(1)
             break
     kept = []
+    in_footer = False
     for line in (stdout or '').splitlines():
         stripped = line.strip()
+        # Skip known noise lines
+        if not stripped:
+            continue
         if stripped.startswith('Warning:') or stripped.startswith('\u21bb Resumed session'):
             continue
         if _SESSION_ID_RE.match(stripped):
+            continue
+        # Skip TUI box-drawing lines (╭ ╰ ╮ ╯ │)
+        if any(c in stripped for c in ('╭', '╰', '╮', '╯')):
+            continue
+        if stripped == '│':
+            continue
+        # Skip hermes CLI noise
+        if stripped in ('Initializing agent...',):
+            continue
+        if stripped.startswith('Query: '):
+            continue
+        # Skip horizontal separator lines (──, ═, ─)
+        if all(c in '─═━' for c in stripped) and len(stripped) > 3:
+            continue
+        # Skip session summary footer
+        if stripped.startswith('Resume this session with:'):
+            in_footer = True
+            continue
+        if in_footer and (stripped.startswith('Session:') or stripped.startswith('Duration:') or stripped.startswith('Messages:')):
+            continue
+        in_footer = False
+        # Skip JSON block markers
+        if stripped in ('```json', '```'):
             continue
         kept.append(line)
     return _strip_tool_blocks('\n'.join(kept)), session_id
@@ -644,10 +671,12 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                 while not progress_stop.is_set():
                     elapsed = time.time() - last_progress_time[0]
                     if elapsed >= IMBOT_TIMEOUT and send_progress:
-                        mins = int(elapsed / 60)
-                        secs = int(elapsed % 60)
-                        log.info("Progress: sending pulse (%dm %ds)" % (mins, secs))
-                        send_progress("🔄 Working… (%dm %ds elapsed)" % (mins, secs))
+                        tc = tool_count[0]
+                        summary = "🔄 Working…"
+                        if tc > 0:
+                            summary += " — %d tool call(s)" % tc
+                        log.info("Progress: sending pulse (elapsed %.0fs)" % elapsed)
+                        send_progress(summary)
                         last_progress_time[0] = time.time()
                     progress_stop.wait(5)
 
@@ -655,13 +684,13 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
             progress_thread.start()
 
             try:
+                tool_count = [0]
                 for line in proc.stdout:
-                    line = line.rstrip('\\n\\r')
-                    # Forward every non-empty line as progress during execution.
-                    # After the agent finishes, the FULL stdout is returned as the reply.
-                    if line.strip() and send_progress and len(line) < 500:
-                        send_progress(line.strip())
+                    line = line.rstrip('\n\r')
                     stdout_lines.append(line)
+                    # Count tool invocations for the periodic pulse summary
+                    if any(kw in line for kw in ('Tool:', 'tool_call', '<｜｜DSML｜｜tool_calls>', '▌')):
+                        tool_count[0] += 1
             except BaseException:
                 pass
 
@@ -698,7 +727,13 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
         if proc.returncode != 0:
             err_msg = stderr.strip() if stderr else 'empty response'
             log.error("Agent exited %s: %s" % (proc.returncode, err_msg[:200]))
-            if existing_sid and 'session not found' in err_msg.lower():
+            # Auto-reset session on known session errors
+            session_lost = existing_sid and (
+                'session not found' in err_msg.lower() or
+                'resumed session' in err_msg.lower() or
+                (not stdout.strip() and 'session_id' in err_msg.lower())
+            )
+            if session_lost:
                 room_sessions.pop(room_id, None)
                 _save_json(SESSION_MAP_FILE, room_sessions)
                 if not _is_retry:
