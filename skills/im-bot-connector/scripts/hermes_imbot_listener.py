@@ -672,8 +672,11 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                     elapsed = time.time() - last_progress_time[0]
                     if elapsed >= IMBOT_TIMEOUT and send_progress:
                         tc = tool_count[0]
+                        act = last_activity[0]
                         summary = "🔄 Working…"
-                        if tc > 0:
+                        if act:
+                            summary += " — %s" % act
+                        elif tc > 0:
                             summary += " — %d tool call(s)" % tc
                         log.info("Progress: sending pulse (elapsed %.0fs)" % elapsed)
                         send_progress(summary)
@@ -685,12 +688,19 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
 
             try:
                 tool_count = [0]
+                last_activity = ['']
                 for line in proc.stdout:
                     line = line.rstrip('\n\r')
                     stdout_lines.append(line)
                     # Count tool invocations for the periodic pulse summary
                     if any(kw in line for kw in ('Tool:', 'tool_call', '<｜｜DSML｜｜tool_calls>', '▌')):
                         tool_count[0] += 1
+                    # Extract activity from hermes progress lines (┊ emoji description)
+                    if '┊' in line:
+                        marker = line.find('┊')
+                        rest = line[marker+1:].strip()
+                        if rest:
+                            last_activity[0] = rest
             except BaseException:
                 pass
 
