@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-im-bot Agent Listener (v6 — unified backend, async socket.io)
+im-bot Agent Listener (v6.3 — unified backend, rich progress, session history, holding retry)
 ===============================================================
 Persistent Socket.io connection to im-bot's /agent namespace. Responds via a
 real agent CLI — Hermes Agent, OpenClaw, or Claude (auto-detected).
@@ -38,6 +38,7 @@ INVITE_CODE     = os.environ.get('INVITE_CODE',     'YOUR_AGENT_INVITE_CODE')
 IMBOT_MODEL     = os.environ.get('IMBOT_MODEL',     '')
 IMBOT_TOOLSETS  = os.environ.get('IMBOT_TOOLSETS',  'web,browser,terminal,file,code_execution,vision,memory,session_search,skills,todo,delegation')
 IMBOT_TIMEOUT   = int(os.environ.get('IMBOT_TIMEOUT', '60'))       # progress cadence (s)
+PROGRESS_THROTTLE = int(os.environ.get('PROGRESS_THROTTLE', '3'))  # min seconds between progress msgs
 IMBOT_HARD_TIMEOUT = int(os.environ.get('IMBOT_HARD_TIMEOUT', '0')) # 0=unlimited
 IMBOT_SOURCE    = os.environ.get('IMBOT_SOURCE',    'imbot')
 IMBOT_HB_INTERVAL  = int(os.environ.get('IMBOT_HB_INTERVAL', '25'))
@@ -95,6 +96,7 @@ BACKEND, AGENT_BIN = _detect_backend()
 
 SESSION_MAP_FILE = os.path.expanduser('~/.hermes/imbot_sessions.json')
 MODEL_MAP_FILE   = os.path.expanduser('~/.hermes/imbot_room_models.json')
+SESSION_HISTORY_FILE = os.path.expanduser('~/.hermes/imbot_session_history.json')
 
 # ── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = logging.DEBUG if '--debug' in sys.argv else logging.INFO
@@ -232,6 +234,28 @@ _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
 _CLARIFY_RE    = re.compile(r'\[CLARIFY:(\{.*?\})\]', re.DOTALL)
 _MEDIA_RE      = re.compile(r'MEDIA:(/[^\s\n]+)', re.IGNORECASE)
 
+# Patterns that indicate a "hold on / working" status message (not a real reply)
+_HOLDING_PATTERNS = [
+    re.compile(r'正在.{0,6}(?:调研|搜索|查询|整理|分析|处理|联网|检索|爬|跑|加载|下载|生成|计算|编译|构建|部署)'),
+    re.compile(r'(?:稍等|请稍[候等]|稍[候等]|等(?:一下|几分钟|一会)|马上|很快|一会儿).{0,10}(?:给|发|回|好|完|成)'),
+    re.compile(r"(?:let me|I'll|I will).{0,20}(?:research|search|check|look|find|gather|compile|summarize|get back|come back|work on)"),
+    re.compile(r'(?:working on|running|processing|fetching|loading).{0,30}(?:now|background|moment|minute)'),
+    re.compile(r'(?:后台|异步).{0,10}(?:跑|执行|处理|工作|任务)'),
+    re.compile(r'结果.{0,10}(?:回来|出来|好了|完成).{0,10}(?:给|发|整理|汇总|提炼|总结)'),
+]
+# Max length for a holding reply (longer messages likely have real content)
+_HOLDING_MAX_LEN = 300
+
+def _is_holding_reply(text):
+    """Return True if the reply is just a 'hold on / working' status message
+    with no real deliverable content."""
+    t = (text or '').strip()
+    if not t or len(t) > _HOLDING_MAX_LEN:
+        return False
+    if any(marker in t for marker in ('```', '1.', '- ', ':\n', ':\n', '|')):
+        return False
+    return any(p.search(t) for p in _HOLDING_PATTERNS)
+
 # ── Content safety ──────────────────────────────────────────────────────────
 _OUTPUT_BLOCKLIST = [
     'child porn', 'childporn', 'lolita', 'pedo', 'preteen', 'underage',
@@ -293,7 +317,15 @@ def build_system_preamble():
         "4. Be concise. Long acknowledgements waste everyone's tokens.\n"
         "5. Your replies are NOT automatically visible to other agents.\n"
         "   To address another agent, use @AgentName in your message.\n"
-        "   Without @, other agents will not see your reply.\n\n"
+        "   Without @, other agents will not see your reply.\n"
+        "6. CRITICAL — NO BACKGROUND TASKS: You CANNOT run tasks in the\n"
+        "   background or send follow-up messages later. Each reply is a\n"
+        "   single atomic turn — after you reply, you go idle until the\n"
+        "   user sends another message. NEVER say things like \"I'll work\n"
+        "   on this in the background\", \"I'll come back to you\", \"let me\n"
+        "   run this and get back to you\", or any promise of future\n"
+        "   delivery. If a task takes time, do it NOW in this turn and\n"
+        "   deliver the result in the same reply.\n\n"
         "The user's first message follows:\n"
     )
 
@@ -417,47 +449,82 @@ def _scan_output(text):
 
 def _parse_agent_output(stdout, stderr):
     session_id = None
+    # Try stderr first (legacy -Q mode), then stdout footer
     for line in (stderr or '').splitlines():
         m = _SESSION_ID_RE.match(line.strip())
         if m:
             session_id = m.group(1)
             break
-    kept = []
+    if not session_id:
+        for line in (stdout or '').splitlines():
+            s = line.strip()
+            if s.startswith('Session:') and not s.startswith('Session ended'):
+                sid = s.split(':', 1)[1].strip().split()[0]
+                if sid:
+                    session_id = sid
+                    break
+    # Track LAST reply block — when sessions are resumed, Hermes outputs
+    # multiple ╭╰ blocks (one per tool turn). Only keep the final reply.
+    last_reply_lines = []
+    in_reply = False
     in_footer = False
+    in_diff = False
     for line in (stdout or '').splitlines():
         stripped = line.strip()
-        # Skip known noise lines
+        # Detect reply block boundaries
+        if any(c in stripped for c in ('╭',)):
+            in_reply = True
+            last_reply_lines = []
+            continue
+        if any(c in stripped for c in ('╰',)):
+            in_reply = False
+            continue
+        if not in_reply:
+            # Outside reply blocks — only extract session_id from stderr
+            continue
+        # Inside a reply block — filter noise but keep content
         if not stripped:
             continue
         if stripped.startswith('Warning:') or stripped.startswith('\u21bb Resumed session'):
             continue
         if _SESSION_ID_RE.match(stripped):
             continue
-        # Skip TUI box-drawing lines (╭ ╰ ╮ ╯ │)
-        if any(c in stripped for c in ('╭', '╰', '╮', '╯')):
-            continue
         if stripped == '│':
             continue
-        # Skip hermes CLI noise
         if stripped in ('Initializing agent...',):
             continue
         if stripped.startswith('Query: '):
             continue
-        # Skip horizontal separator lines (──, ═, ─)
         if all(c in '─═━' for c in stripped) and len(stripped) > 3:
             continue
-        # Skip session summary footer
-        if stripped.startswith('Resume this session with:'):
+        if stripped.startswith('- 👤') or stripped.startswith('- 🤖'):
+            continue
+        if stripped.startswith('Resume this session with:') or stripped.startswith('hermes --resume'):
             in_footer = True
             continue
         if in_footer and (stripped.startswith('Session:') or stripped.startswith('Duration:') or stripped.startswith('Messages:')):
             continue
         in_footer = False
-        # Skip JSON block markers
         if stripped in ('```json', '```'):
             continue
-        kept.append(line)
-    return _strip_tool_blocks('\n'.join(kept)), session_id
+        # Skip progress lines (┊) and their associated diff output
+        if '┊' in stripped:
+            in_diff = True
+            continue
+        if in_diff and (
+            stripped.startswith(('a/', 'b/')) or
+            stripped.startswith('@@') or
+            stripped.startswith('index ') or
+            stripped.startswith('diff --git') or
+            stripped.startswith('--- ') or
+            stripped.startswith('+++ ') or
+            stripped == '\\ No newline at end of file' or
+            (stripped and stripped[0] in '+-')
+        ):
+            continue
+        in_diff = False
+        last_reply_lines.append(line)
+    return _strip_tool_blocks('\n'.join(last_reply_lines)), session_id
 
 def _parse_clarify(text):
     blocks = _CLARIFY_RE.findall(text or '')
@@ -564,10 +631,10 @@ def _build_cmd(resume_sid, content, room_id):
     # Hermes (default)
     if resume_sid:
         cmd = [AGENT_BIN, '-r', resume_sid, 'chat', '-q', content,
-               '--source', IMBOT_SOURCE, '-Q']
+               '--source', IMBOT_SOURCE]
     else:
         full = build_system_preamble() + content
-        cmd = [AGENT_BIN, 'chat', '-q', full, '--source', IMBOT_SOURCE, '-Q']
+        cmd = [AGENT_BIN, 'chat', '-q', full, '--source', IMBOT_SOURCE]
     if model:
         cmd.extend(['-m', model])
     if IMBOT_TOOLSETS:
@@ -663,37 +730,69 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
             stderr_thread = threading.Thread(target=read_stderr, daemon=True)
             stderr_thread.start()
 
-            # Background progress sender — agent CLI may not output stdout lines,
-            # so we send periodic pulse updates to keep the user informed.
-            progress_stop = threading.Event()
-            last_progress_time = [time.time()]
-            def progress_loop():
-                while not progress_stop.is_set():
-                    elapsed = time.time() - last_progress_time[0]
-                    if elapsed >= IMBOT_TIMEOUT and send_progress:
-                        tc = tool_count[0]
-                        act = last_activity[0]
-                        summary = "🔄 Working…"
-                        if act:
-                            summary += " — %s" % act
-                        elif tc > 0:
-                            summary += " — %d tool call(s)" % tc
-                        log.info("Progress: sending pulse (elapsed %.0fs)" % elapsed)
-                        send_progress(summary)
-                        last_progress_time[0] = time.time()
-                    progress_stop.wait(5)
+            # Event-driven progress: send stdout deltas as progress messages.
+            # Replaces the old periodic timer pulse — now every new meaningful
+            # line is accumulated and flushed as a batch, throttled to avoid
+            # message storms (max one progress msg every PROGRESS_THROTTLE sec).
+            progress_buffer = []       # accumulated filtered output lines
+            sent_count = 0             # how many buffer lines already emitted
+            last_flush = time.time()   # last progress emit timestamp
 
-            progress_thread = threading.Thread(target=progress_loop, daemon=True)
-            progress_thread.start()
+            def _is_diff_line(s):
+                """Return True if this line looks like a unified diff fragment."""
+                return (
+                    s.startswith('diff --git') or s.startswith('index ') or
+                    s.startswith('--- ') or s.startswith('+++ ') or
+                    s.startswith('@@') or s.startswith('+') or s.startswith('-') or
+                    s.startswith('\\ No newline') or
+                    'a/' in s[:4] or 'b/' in s[:4]   # a/foo.py b/foo.py
+                )
+
+            def _is_tui_noise(s):
+                """Return True if this line is pure TUI decoration, separator, or low-value output."""
+                if not s:
+                    return True
+                # Pure box-drawing characters
+                if set(s).issubset({'╭','╰','─','│','├','┤','┬','┴','┼','╮','╯',' '}):
+                    return True
+                # TUI borders containing text: ╭─ ⚕ Hermes ───...╮
+                if s[0] in '╭╰├┤┌┐└┘' and s[-1] in '╭╰╮╯├┤┌┐└┘│':
+                    return True
+                # Repeated separator chars (─── or === or ***)
+                if len(s) > 8 and len(set(s.replace('─','').replace('═','').replace('━','').replace('─','').strip())) <= 2:
+                    return True
+                # Overly long lines → commands, path lists, base64 blobs
+                if len(s) > 200:
+                    return True
+                # Session / footer metadata
+                if s.startswith('Session:') or s.startswith('Duration:') or s.startswith('Messages:'):
+                    return True
+                if s.startswith('Query:') or s == 'Enter your query (or /help):':
+                    return True
+                # User/assistant echo lines (e.g. "- 👤 Hello" / "- 🤖 Reply")
+                if s.startswith('- 👤') or s.startswith('- 🤖'):
+                    return True
+                # Hermes session/init noise
+                if s.startswith('↻ Resumed session'):
+                    return True
+                if s == 'Initializing agent...':
+                    return True
+                # Pure ANSI codes
+                if '\x1b[' in s and len(s.replace('\x1b', '').strip()) < 10:
+                    return True
+                return False
 
             try:
                 tool_count = [0]
                 last_activity = ['']
+                in_diff_block = False  # track multi-line diff segments
+                in_tool_block = False  # suppress verbose tool output (diff/code) between ┊ lines
+                in_query_preamble = False  # suppress Hermes query echo (incl SYSTEM block) until first ┊
                 for line in proc.stdout:
                     line = line.rstrip('\n\r')
                     stdout_lines.append(line)
-                    # Count tool invocations for the periodic pulse summary
-                    if any(kw in line for kw in ('Tool:', 'tool_call', '<｜｜DSML｜｜tool_calls>', '▌')):
+                    # Count tool invocations for final summary
+                    if any(kw in line for kw in ('Tool:', 'tool_call', '<｜｜DSML｜｜tool_calls>', '▌', '┊')):
                         tool_count[0] += 1
                     # Extract activity from hermes progress lines (┊ emoji description)
                     if '┊' in line:
@@ -701,6 +800,72 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                         rest = line[marker+1:].strip()
                         if rest:
                             last_activity[0] = rest
+                        # Clear query preamble on first ┊ line
+                        in_query_preamble = False
+                        # Suppress tool output for verbose tools (diff/write/patch/code)
+                        if any(kw in rest.lower() for kw in ('diff', 'write', 'patch', 'code')):
+                            in_tool_block = True
+                        else:
+                            in_tool_block = False
+
+                    stripped = line.strip()
+
+                    # Skip query preamble (Query: echo + SYSTEM block + room members + user msg echo)
+                    if in_query_preamble:
+                        continue
+
+                    # Start query preamble tracking
+                    if stripped.startswith('Query:') or stripped == 'Enter your query (or /help):':
+                        in_query_preamble = True
+                        continue
+
+                    # Skip verbose tool block content
+                    if in_tool_block and '┊' not in stripped:
+                        continue
+
+                    # Skip TUI noise
+                    if _is_tui_noise(stripped):
+                        continue
+
+                    # Deduplicate consecutive identical ┊ progress lines
+                    # Hermes reprints the same preparing/running line repeatedly
+                    if '┊' in stripped:
+                        if progress_buffer and progress_buffer[-1] == stripped:
+                            continue
+
+                    # Skip diff blocks — both the header lines and content (+/-/@@ lines)
+                    if _is_diff_line(stripped):
+                        in_diff_block = True
+                        continue
+                    if in_diff_block:
+                        # Once we hit a non-diff, non-empty line, the diff block ends
+                        if stripped and not stripped.startswith(' '):
+                            in_diff_block = False
+                        else:
+                            continue
+
+                    progress_buffer.append(stripped)
+
+                    # Flush only new content (since last sent), throttled
+                    now = time.time()
+                    new_count = len(progress_buffer) - sent_count
+                    if tool_count[0] > 0 and (new_count >= 15 or (new_count > 0 and now - last_flush >= PROGRESS_THROTTLE)):
+                        delta = '\n'.join(progress_buffer[sent_count:])
+                        if send_progress and delta.strip():
+                            send_progress(delta.strip())
+                        sent_count = len(progress_buffer)
+                        last_flush = now
+                        # Keep buffer bounded
+                        if len(progress_buffer) > 100:
+                            progress_buffer = progress_buffer[-40:]
+                            sent_count = min(sent_count, len(progress_buffer))
+
+                # Flush any remaining new lines (only if tools were used)
+                remainder = progress_buffer[sent_count:]
+                if remainder and send_progress and tool_count[0] > 0:
+                    delta = '\n'.join(remainder)
+                    if delta.strip():
+                        send_progress(delta.strip())
             except BaseException:
                 pass
 
@@ -710,17 +875,14 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                 proc.kill()
                 try: proc.wait(timeout=5)
                 except BaseException: pass
-                progress_stop.set()
                 stderr_thread.join(timeout=2)
                 return "⚠️ 任务超时（%ds），请拆分成更小的步骤。" % IMBOT_AGENT_TIMEOUT
 
-            progress_stop.set()
             stderr_thread.join(timeout=2)
             stdout = '\n'.join(stdout_lines)
             stderr = ''.join(stderr_lines)
         except Exception as e:
             log.error("Agent process error: %s" % e)
-            progress_stop.set()
             try: proc.kill()
             except: pass
             return "Internal error: %s" % str(e)[:200]
@@ -804,22 +966,61 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
         members_ctx = await build_members_context(room_id)
         if members_ctx:
             effective = members_ctx + effective
+        # CRITICAL: suppress status-only replies — deliver result or nothing
+        effective = (
+            "[SYSTEM: Your reply goes directly to the user as a chat message.\n"
+            "Do NOT output status updates like 'researching', 'please wait',\n"
+            "'working on it', 'let me check', or any process narration.\n"
+            "Work silently with tools, then output ONLY the finished answer.\n"
+            "If you need to say something before finishing — DON'T. Just work.]\n\n"
+            + effective
+        )
 
         reply = await asyncio.get_event_loop().run_in_executor(
             None, call_agent, effective, room_id, send_progress, task_id)
 
-        # Content safety scan
-        blocked, hit = _scan_output(reply)
-        if blocked:
-            log.warning("BLOCKED output for room %s: matched '%s'" % (room_id, hit))
-            await sio.emit('message:send',
-                           {'roomId': room_id,
-                            'content': '⚠️ My response was blocked by content safety filters.',
-                            'msgType': 'text'}, namespace='/agent')
-            return
+        # ── Holding-reply retry loop ──────────────────────────────────
+        # Weaker models may output status narration ("正在调研…") without
+        # actually delivering results. Detect this and nudge them to continue.
+        MAX_HOLDING_RETRIES = 2
+        holding_retries = 0
+        while True:
+            # Content safety scan
+            blocked, hit = _scan_output(reply)
+            if blocked:
+                log.warning("BLOCKED output for room %s: matched '%s'" % (room_id, hit))
+                await sio.emit('message:send',
+                               {'roomId': room_id,
+                                'content': '⚠️ My response was blocked by content safety filters.',
+                                'msgType': 'text'}, namespace='/agent')
+                return
 
-        # MEDIA: parsing + file sending
-        clean_reply, attachments = _parse_media(reply, room_id)
+            # MEDIA: parsing + file sending (only on final reply)
+            clean_reply, attachments = _parse_media(reply, room_id)
+
+            # CLARIFY parsing
+            clean_text, clarifies = _parse_clarify(clean_reply)
+
+            if clean_text and _is_holding_reply(clean_text) and holding_retries < MAX_HOLDING_RETRIES:
+                # Reroute to progress, then nudge agent to continue this session
+                holding_retries += 1
+                log.info("[%s] Holding reply #%d: %s..." % (room_id[:12], holding_retries, clean_text[:80]))
+                await sio.emit('message:send', {
+                    'roomId': room_id, 'content': clean_text, 'msgType': 'progress',
+                }, namespace='/agent')
+                # Nudge: the session is already saved, so call_agent will resume it
+                effective = (
+                    "[SYSTEM: Continue working. Output your FINAL answer NOW — "
+                    "no narration, no status updates, just the deliverable.]"
+                )
+                reply = await asyncio.get_event_loop().run_in_executor(
+                    None, call_agent, effective, room_id, send_progress, task_id)
+                continue
+
+            # Final reply (not holding, or retries exhausted)
+            break
+
+        # Send attachments (only on final reply)
         for att in attachments:
             try:
                 meta = json.dumps({
@@ -837,10 +1038,7 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
             except Exception as e:
                 log.warning("[%s] File send failed: %s" % (room_id[:12], e))
 
-        # CLARIFY parsing
-        clean_text, clarifies = _parse_clarify(clean_reply)
-
-        # Send text reply
+        # Send text reply — after retry loop (not holding, or retries exhausted)
         if clean_text:
             await sio.emit('message:send', {
                 'roomId': room_id, 'content': clean_text, 'msgType': 'text',
@@ -1121,7 +1319,21 @@ async def async_main():
         old_sid = room_sessions.pop(room_id, None)
         if old_sid:
             _save_json(SESSION_MAP_FILE, room_sessions)
+            # Save to history so user can switch back
+            history = _load_json(SESSION_HISTORY_FILE, {})
+            history[room_id] = old_sid
+            _save_json(SESSION_HISTORY_FILE, history)
             log.info("[%s] Session reset — dropped session %s" % (room_id[:12], old_sid))
+            # Send system message with session ID for switch-back
+            try:
+                await sio.emit('message:send', {
+                    'roomId': room_id,
+                    'content': 'Session ended: %s' % old_sid,
+                    'msgType': 'system',
+                    'metadata': json.dumps({'sessionId': old_sid, 'action': 'session:ended'}),
+                }, namespace='/agent')
+            except Exception:
+                pass
         else:
             log.info("[%s] Session reset — no active session to drop" % room_id[:12])
         _guard_reset(room_id)
@@ -1131,6 +1343,57 @@ async def async_main():
         # Ack back so server knows we processed it
         try:
             await sio.emit('session:reset:ack', {'roomId': room_id}, namespace='/agent')
+        except Exception:
+            pass
+
+    @sio.on('session:restore', namespace='/agent')
+    async def on_session_restore(data):
+        """User clicked 'switch back' — save current session, restore old one."""
+        room_id = data.get('roomId') if isinstance(data, dict) else data
+        if not room_id:
+            return
+        history = _load_json(SESSION_HISTORY_FILE, {})
+        target_sid = history.pop(room_id, None)
+        if not target_sid:
+            log.info("[%s] Session restore — no history found" % room_id[:12])
+            return
+        # Save current session to history before switching away
+        cur_sid = room_sessions.pop(room_id, None)
+        if not cur_sid:
+            # No active session — mark as placeholder so user can switch back
+            cur_sid = 'new-' + str(int(time.time()))
+        if cur_sid != target_sid:
+            history[room_id] = cur_sid
+            _save_json(SESSION_HISTORY_FILE, history)
+            log.info("[%s] Session ended (switch-back): %s" % (room_id[:12], cur_sid))
+            try:
+                await sio.emit('message:send', {
+                    'roomId': room_id,
+                    'content': 'Session ended: %s' % cur_sid,
+                    'msgType': 'system',
+                    'metadata': json.dumps({'sessionId': cur_sid, 'action': 'session:ended'}),
+                }, namespace='/agent')
+            except Exception:
+                pass
+        else:
+            # Same session — save but don't send duplicate ended
+            history[room_id] = cur_sid
+            _save_json(SESSION_HISTORY_FILE, history)
+        # Restore the target session
+        room_sessions[room_id] = target_sid
+        _save_json(SESSION_MAP_FILE, room_sessions)
+        _guard_reset(room_id)
+        with _turn_guard:
+            _room_turn.pop(room_id, None)
+            _room_restart.pop(room_id, None)
+        log.info("[%s] Session restored: %s" % (room_id[:12], target_sid))
+        # Send restored AFTER ended (await to guarantee order)
+        try:
+            await sio.emit('message:send', {
+                'roomId': room_id,
+                'content': 'Session restored: %s' % target_sid,
+                'msgType': 'system',
+            }, namespace='/agent')
         except Exception:
             pass
 
