@@ -103,6 +103,42 @@ LOG_LEVEL = logging.DEBUG if '--debug' in sys.argv else logging.INFO
 logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('imbot-agent')
 
+# ── Non-blocking stdout/stderr ──────────────────────────────────────────────
+# When run under supervisord with redirect_stderr=true, stdout and stderr are
+# pipes. If the pipe reader (supervisord) falls behind, writes block the process
+# — including the asyncio event loop — causing the connector to freeze while
+# heartbeats continue at the socket level. Make stdout/stderr non-blocking and
+# wrap the root StreamHandler to survive BlockingIOError gracefully.
+import fcntl
+def _make_nonblocking(fd: int) -> None:
+    """Set a file descriptor to non-blocking mode (best-effort)."""
+    try:
+        flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+    except OSError:
+        pass  # not a pipe / not supported — no-op
+
+_make_nonblocking(sys.stdout.fileno())
+_make_nonblocking(sys.stderr.fileno())
+
+# Replace root StreamHandler with a non-blocking wrapper that survives
+# BlockingIOError when the supervisor pipe is full.
+_root = logging.getLogger()
+for _h in list(_root.handlers):
+    if isinstance(_h, logging.StreamHandler):
+        _root.removeHandler(_h)
+        _bh = logging.StreamHandler(_h.stream)
+        _bh.setLevel(_h.level)
+        _bh.setFormatter(_h.formatter)
+        _original_emit = _bh.emit
+        def _safe_emit(record: logging.LogRecord) -> None:
+            try:
+                _original_emit(record)
+            except BlockingIOError:
+                pass  # pipe full: drop this log line, don't freeze the process
+        _bh.emit = _safe_emit  # type: ignore[method-assign]
+        _root.addHandler(_bh)
+
 # ── Global state ────────────────────────────────────────────────────────────
 sio = None
 agent_id = None
