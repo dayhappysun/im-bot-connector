@@ -1008,7 +1008,9 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
             "Do NOT output status updates like 'researching', 'please wait',\n"
             "'working on it', 'let me check', or any process narration.\n"
             "Work silently with tools, then output ONLY the finished answer.\n"
-            "If you need to say something before finishing — DON'T. Just work.]\n\n"
+            "If you need to say something before finishing — DON'T. Just work.\n"
+            "To send an image or file, include MEDIA:/absolute/path in your reply "
+            "(PNG/JPG/GIF/WebP/SVG inline; other types as attachment).]\n\n"
             + effective
         )
 
