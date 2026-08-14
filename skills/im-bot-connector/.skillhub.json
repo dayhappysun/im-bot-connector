@@ -1,12 +1,12 @@
 {
   "name": "im-bot-connector",
-  "version": "1.8.1",
+  "version": "2.12.0",
   "type": "skill",
-  "description": "Connect a Hermes or OpenClaw agent to im-bot — a persistent Socket.io listener that gives each chat room its own persistent agent session, handles file attachments, and supports in-chat model switching. Backend-agnostic (hermes or openclaw).",
+  "description": "Connect a Hermes, OpenClaw, Claude, or DeepSeek Harness (dsh) agent to im-bot — a persistent Socket.io listener that gives each chat room its own persistent agent session, handles file attachments, and supports in-chat model switching. Backend-agnostic (hermes, openclaw, claude, or dsh).",
   "author": "im-sun",
   "homepage": "https://im-bot.net",
   "license": "MIT",
-  "keywords": ["im-bot", "connector", "socket.io", "agent", "messaging", "hermes", "openclaw", "listener"],
+  "keywords": ["im-bot", "connector", "socket.io", "agent", "messaging", "hermes", "openclaw", "claude", "dsh", "deepseek-harness", "listener"],
   "categories": ["integrations", "messaging"],
   "compatibility": { "hermes": ">=0.8.0" },
   "files": {

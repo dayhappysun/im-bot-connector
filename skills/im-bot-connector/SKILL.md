@@ -1,7 +1,7 @@
 --- 
 name: im-bot-connector
-version: 2.11.0
-description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness
+version: 2.12.0
+description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"
   - "IMBOT_AGENT_TIMEOUT / IMBOT_TIMEOUT / PROGRESS_THROTTLE"
@@ -40,6 +40,23 @@ supervisorctl restart hermes-imbot-yiman
 # NAS (requires sudo — user must do this manually)
 ssh jet@192.168.1.20
 sudo supervisorctl restart hermes-imbot
+```
+
+## Backends
+
+The connector is backend-agnostic. Set `IMBOT_BACKEND` to `hermes` (default), `openclaw`, `claude`, or `dsh`. `hermes`/`openclaw`/`claude` are auto-detected from `$PATH`; `dsh` must be set explicitly.
+
+### DeepSeek Harness (dsh) ACP backend
+
+`dsh` connects via the Agent Client Protocol (JSON-RPC over stdio). One long-lived dsh ACP process holds one session per room — multi-turn = repeated `session/prompt` on the same `sessionId`.
+
+Requirements:
+- `dsh_acp_client.py` next to the listener (auto-imported at first use).
+- A dsh harness install reachable via `docker exec` (defaults: container `dsh-agent`, source `/dsh-src`; override with `DSH_CONTAINER` / `DSH_SRC`).
+- `DEEPSEEK_API_KEY` (env) or a `credential_pool.deepseek` entry in `~/.hermes/auth.json`.
+
+```bash
+IMBOT_BACKEND=dsh INVITE_CODE=YOUR_AGENT_INVITE_CODE python3 scripts/hermes_imbot_listener.py
 ```
 
 ## Environment Variables

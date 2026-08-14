@@ -60,6 +60,7 @@ BACKEND_BINS = {
     'hermes':   ['hermes'],
     'openclaw': ['openclaw', 'claw'],
     'claude':   ['claude'],
+    'dsh':      ['dsh'],
 }
 
 def _find_bin(name):
@@ -972,6 +973,60 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
 
 
 # ── Socket.io event handlers + main runner (async) ──────────────────────────
+# ── dsh (DeepSeek Harness) ACP backend ──────────────────────────────────────
+# One long-lived dsh ACP process; one session per room (multi-turn via repeated
+# session/prompt on the same sessionId). Lazily started on first use.
+DSH_CLIENT = None
+DSH_CLIENT_LOCK = asyncio.Lock()
+
+def _build_dsh_cmd():
+    """Build the dsh ACP server launch command (docker exec + node + tsx)."""
+    key = os.environ.get('DEEPSEEK_API_KEY', '')
+    base = os.environ.get('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1')
+    if not key:
+        try:
+            with open(os.path.expanduser('~/.hermes/auth.json')) as f:
+                pool = json.load(f).get('credential_pool', {}).get('deepseek', [])
+            if pool:
+                key = pool[0].get('access_token', '') or key
+                base = pool[0].get('base_url', base)
+        except Exception:
+            pass
+    if not key:
+        raise RuntimeError('DEEPSEEK_API_KEY not found (env or ~/.hermes/auth.json)')
+    container = os.environ.get('DSH_CONTAINER', 'dsh-agent')
+    dsh_src = os.environ.get('DSH_SRC', '/dsh-src')
+    return (
+        'docker exec -i -e DEEPSEEK_API_KEY=%s -e DEEPSEEK_BASE_URL=%s '
+        '%s sh -c "cd %s && node --import tsx '
+        'packages/examples/acp-demo/src/bin.ts '
+        '--config examples/acp-agent/cordis.yml"' % (key, base, container, dsh_src)
+    )
+
+async def _get_dsh_client():
+    global DSH_CLIENT
+    if DSH_CLIENT is None:
+        async with DSH_CLIENT_LOCK:
+            if DSH_CLIENT is None:
+                try:
+                    import dsh_acp_client as dsh_mod
+                except ImportError:
+                    log.error('dsh_acp_client.py not found next to connector')
+                    raise
+                DSH_CLIENT = dsh_mod.DshAcpClient(_build_dsh_cmd(), cwd='/tmp', log=log.info)
+                await DSH_CLIENT.start()
+    return DSH_CLIENT
+
+async def _invoke_agent(room_id, effective, send_progress, task_id):
+    """Invoke the agent backend (dsh via ACP; others via sync subprocess)."""
+    if BACKEND == 'dsh':
+        client = await _get_dsh_client()
+        text, stop_reason = await client.prompt(room_id, effective)
+        return text
+    return await asyncio.get_event_loop().run_in_executor(
+        None, call_agent, effective, room_id, send_progress, task_id)
+
+
 async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
     """Run one agent turn (off the socket read loop, so other rooms stay alive)."""
     main_loop = asyncio.get_running_loop()
@@ -1014,8 +1069,7 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
             + effective
         )
 
-        reply = await asyncio.get_event_loop().run_in_executor(
-            None, call_agent, effective, room_id, send_progress, task_id)
+        reply = await _invoke_agent(room_id, effective, send_progress, task_id)
 
         # ── Holding-reply retry loop ──────────────────────────────────
         # Weaker models may output status narration ("正在调研…") without
@@ -1051,8 +1105,7 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
                     "[SYSTEM: Continue working. Output your FINAL answer NOW — "
                     "no narration, no status updates, just the deliverable.]"
                 )
-                reply = await asyncio.get_event_loop().run_in_executor(
-                    None, call_agent, effective, room_id, send_progress, task_id)
+                reply = await _invoke_agent(room_id, effective, send_progress, task_id)
                 continue
 
             # Final reply (not holding, or retries exhausted)
