@@ -1,6 +1,6 @@
 --- 
 name: im-bot-connector
-version: 2.13.0
+version: 2.14.0
 description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"
@@ -92,8 +92,8 @@ Overall hard cap for the agent run.
 2. Check logs: `tail -20 /tmp/hermes-imbot.log` — if log stopped updating, WebSocket likely dropped
 3. Check active connections: `ss -tnp | grep $(pgrep -f hermes-imbot-listener)` — should see both the im-bot server connection AND model API connections. If only API connections exist, the WebSocket is dead
 4. Look for `Disconnected from /agent` patterns — normal with auto-reconnect IF logs show a subsequent `Connected` event. If not, auto-reconnect failed — see Pitfall #13
-5. **Check heartbeat liveness** (since 2026-08-07): `ssh -p 22022 root@104.207.81.51 "docker exec im-bot-blue node -e \"const{PrismaClient}=require('@prisma/client');const p=new PrismaClient();p.agent.findMany({select:{id:true,name:true,status:true,lastHeartbeatAt:true}}).then(r=>{console.log(JSON.stringify(r,null,2));p.\$disconnect()});\""` — `lastHeartbeatAt` should be within 90s for online agents. If `status='offline'` but `lastHeartbeatAt` is recent, the staleness cron needs investigation. If `lastHeartbeatAt` is old, connector heartbeat isn't reaching the server.
-6. **Check server-side**: `ssh -p 22022 root@104.207.81.51 "docker logs im-bot-blue --tail 50 | grep 'Cross-instance agent unregistered'"` — if present with old timestamp, this is Pitfall #17 (fixed by heartbeat liveness)
+5. **Check heartbeat liveness** (since 2026-08-07): `ssh -p 22 root@138.68.12.68 "docker exec im-bot-blue node -e \"const{PrismaClient}=require('@prisma/client');const p=new PrismaClient();p.agent.findMany({select:{id:true,name:true,status:true,lastHeartbeatAt:true}}).then(r=>{console.log(JSON.stringify(r,null,2));p.\$disconnect()});\""` — `lastHeartbeatAt` should be within 90s for online agents. If `status='offline'` but `lastHeartbeatAt` is recent, the staleness cron needs investigation. If `lastHeartbeatAt` is old, connector heartbeat isn't reaching the server.
+6. **Check server-side**: `ssh -p 22 root@138.68.12.68 "docker logs im-bot-blue --tail 50 | grep 'Cross-instance agent unregistered'"` — if present with old timestamp, this is Pitfall #17 (fixed by heartbeat liveness)
 7. Recovery: `supervisorctl restart hermes-imbot hermes-imbot-yiman` (restart both together)
 8. See `references/agent-offline-diagnosis.md` for full workflow
 
@@ -344,17 +344,17 @@ supervisorctl restart hermes-imbot
     # 521 = origin unreachable. 200 = origin OK, connector problem.
 
     # 2. Is sun-port listening on 443/80?
-    ssh -p 22022 root@104.207.81.51 "ss -tlnp | grep sun-port"
+    ssh -p 22 root@138.68.12.68 "ss -tlnp | grep sun-port"
     # Should show :80, :443, :9090. Empty = sun-port not running.
 
     # 3. Is the container healthy locally?
-    ssh -p 22022 root@104.207.81.51 "curl -s localhost:3001/api/health"
+    ssh -p 22 root@138.68.12.68 "curl -s localhost:3001/api/health"
     # {"status":"ok"} = container is fine, just not reachable from outside.
     ```
 
     **Fix — start sun-port:**
     ```bash
-    ssh -p 22022 root@104.207.81.51 "
+    ssh -p 22 root@138.68.12.68 "
     # Kill any stale processes
     pkill -9 sun-port 2>/dev/null; sleep 1
 
@@ -370,7 +370,7 @@ supervisorctl restart hermes-imbot
 
     **After sun-port is back (verify 443/80 listening):**
     ```bash
-    ssh -p 22022 root@104.207.81.51 "ss -tlnp | grep sun-port"
+    ssh -p 22 root@138.68.12.68 "ss -tlnp | grep sun-port"
     ```
 
     **Start connectors (supervisord may need explicit 'start' after FATAL):**
