@@ -1,6 +1,6 @@
 --- 
 name: im-bot-connector
-version: 2.14.0
+version: 2.15.0
 description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"
@@ -22,7 +22,6 @@ The connector runs via supervisord. **Do NOT edit workspace copies** — they ar
 |---------|-------------|------------------|
 | default | `/root/.local/bin/hermes-imbot-listener` | `hermes-imbot` |
 | yiman | `~/.hermes/profiles/yiman/home/.local/bin/hermes-imbot-listener` | `hermes-imbot-yiman` |
-| NAS | `/home/jet/.local/bin/hermes-imbot-listener` | `hermes-imbot` |
 
 Supervisord configs: `/etc/supervisor/conf.d/*.conf`
 
@@ -36,10 +35,6 @@ supervisorctl restart hermes-imbot
 
 # Yiman
 supervisorctl restart hermes-imbot-yiman
-
-# NAS (requires sudo — user must do this manually)
-ssh jet@192.168.1.20
-sudo supervisorctl restart hermes-imbot
 ```
 
 ## Backends
@@ -92,8 +87,7 @@ Overall hard cap for the agent run.
 2. Check logs: `tail -20 /tmp/hermes-imbot.log` — if log stopped updating, WebSocket likely dropped
 3. Check active connections: `ss -tnp | grep $(pgrep -f hermes-imbot-listener)` — should see both the im-bot server connection AND model API connections. If only API connections exist, the WebSocket is dead
 4. Look for `Disconnected from /agent` patterns — normal with auto-reconnect IF logs show a subsequent `Connected` event. If not, auto-reconnect failed — see Pitfall #13
-5. **Check heartbeat liveness** (since 2026-08-07): `ssh -p 22 root@138.68.12.68 "docker exec im-bot-blue node -e \"const{PrismaClient}=require('@prisma/client');const p=new PrismaClient();p.agent.findMany({select:{id:true,name:true,status:true,lastHeartbeatAt:true}}).then(r=>{console.log(JSON.stringify(r,null,2));p.\$disconnect()});\""` — `lastHeartbeatAt` should be within 90s for online agents. If `status='offline'` but `lastHeartbeatAt` is recent, the staleness cron needs investigation. If `lastHeartbeatAt` is old, connector heartbeat isn't reaching the server.
-6. **Check server-side**: `ssh -p 22 root@138.68.12.68 "docker logs im-bot-blue --tail 50 | grep 'Cross-instance agent unregistered'"` — if present with old timestamp, this is Pitfall #17 (fixed by heartbeat liveness)
+5. **Check heartbeat liveness** (since 2026-08-07): the agent's server-side `lastHeartbeatAt` should be within 90s for online agents. If `status='offline'` but `lastHeartbeatAt` is recent, the staleness cron needs investigation. If `lastHeartbeatAt` is old, connector heartbeat isn't reaching the server.
 7. Recovery: `supervisorctl restart hermes-imbot hermes-imbot-yiman` (restart both together)
 8. See `references/agent-offline-diagnosis.md` for full workflow
 
@@ -219,11 +213,9 @@ supervisorctl restart hermes-imbot
    ```
    default: /root/.local/bin/hermes-imbot-listener
    yiman:   /root/.hermes/profiles/yiman/home/.local/bin/hermes-imbot-listener
-   NAS:     /home/jet/.local/bin/hermes-imbot-listener
    ```
    **After editing, sync ALL active profiles** then restart their supervisord entries.
 2. **IMBOT_TIMEOUT ≠ IMBOT_AGENT_TIMEOUT**: One is progress cadence, one is agent timeout. Don't confuse them.
-3. **NAS deployment via SSH**: NAS connector can be deployed remotely:\n   ```bash\n   scp hermes_imbot_listener.py jet@192.168.1.20:/tmp/\n   ssh jet@192.168.1.20 \"sudo cp /tmp/hermes_imbot_listener.py /home/jet/.local/bin/hermes-imbot-listener && sudo supervisorctl restart hermes-imbot\"\n   ```
 4. **Per-line progress forwarding causes message floods (fixed v6.4)**: As of v6.4, progress messages are event-driven deltas with six-layer filtering — diffs, TUI borders, long lines, duplicate `┊` status, and empty lines are all filtered. `sent_count` tracking prevents message overlap. The old v6.3 periodic pulse pattern is obsolete.
 5. **Server-side splitMessage compounds flooding**: Prior to the 2026-07-16 fix, `socket/index.ts` split agent replies into 3500-char chunks with `splitMessage()`, broadcasting each as a separate `message:new` event. Combined with per-line progress forwarding, this created message storms. The fix removed `splitMessage` — messages now store and broadcast as single units with a 500KB cap.
 6. **Yiman profile missing hermes binary**: The yiman connector runs with `HOME=/root/.hermes/profiles/yiman`. If `~/.local/bin/hermes` doesn't exist under that home, the connector fails every turn with "Sorry, I had trouble processing that. (session_id: ...)". Fix: `ln -s /root/.local/bin/hermes /root/.hermes/profiles/yiman/home/.local/bin/hermes`. The connector uses `os.path.expanduser('~/.local/bin/...')` to locate the binary — it does NOT search PATH.
@@ -322,11 +314,11 @@ supervisorctl restart hermes-imbot
     
     See `references/agent-offline-diagnosis.md` for the full diagnostic workflow.
 
-18. **DB mismatch after Neon migration**: `docker-compose.env` still has the old local `DATABASE_URL`, but the running container uses `-e` flags to override it to Neon. Always verify with `docker exec im-bot-green printenv DATABASE_URL` before querying agent status. Querying `docker exec imbot-db psql` returns stale pre-migration data. Use the active container's Prisma client instead — see `references/agent-offline-diagnosis.md` step 5.
+18. **DB mismatch after Neon migration**: after migrating to Neon, a stale local `DATABASE_URL` can linger in `docker-compose.env` while the running container uses `-e` flags to override it. Always verify against the active container's actual `DATABASE_URL` before querying agent status — querying the old local DB returns stale pre-migration data.
 
-16. **OpenClaw backend (jet_claw, etc.)**: Not all agents use Hermes. Some run OpenClaw with `openclaw-imbot-listener` (a separate Python script) and the OpenClaw gateway (`openclaw gateway --port 18789`). These run via **systemd user service** (not supervisord): `/home/jet/.config/systemd/user/openclaw-imbot.service`. Restart: `systemctl --user restart openclaw-imbot.service` (requires `--privileged` Docker container or direct host access). Log file: `/tmp/imbot-listener.log` (shared with Hermes connectors). Key differences: uses `openclaw` binary at `/home/jet/.npm-global/bin/openclaw`, invite code in systemd env, agent sessions map to OpenClaw sessions (not Hermes `-r`).
+16. **OpenClaw backend**: not all agents use Hermes. Some run OpenClaw via a separate `openclaw-imbot-listener` script plus the OpenClaw gateway. These run under a **systemd user service** (not supervisord), restarted with `systemctl --user restart openclaw-imbot.service`. Key difference: agent sessions map to OpenClaw sessions (not Hermes `-r`).
 
-19. **VPS restart → Cloudflare 520/521 → supervisord FATAL loop** (observed 2026-08-08): When the VPS reboots, **sun-port** (reverse proxy) must auto-start via systemd. As of v2.16.0 the landing page is served from the im-bot container itself (no separate Python HTTP server). Only sun-port needs systemd management.
+19. **Server restart → Cloudflare 520/521 → supervisord FATAL loop** (observed 2026-08-08): after the server reboots, the reverse proxy and its systemd services must auto-start, otherwise the connector's supervisord can enter a FATAL restart loop. Ensure the reverse-proxy service is enabled and auto-starts on boot.
 
 20. **tool_count detection MUST include `┊` for Hermes**: Hermes uses `┊` (not `Tool:` or `tool_call`) for its progress lines:
     ```
@@ -337,96 +329,3 @@ supervisorctl restart hermes-imbot
 
 21. **`[SYSTEM]` preamble leaks into progress via Hermes TUI echo**: The per-turn `[SYSTEM: ...]` block (see Pitfall #11) is prepended to the agent's input. Hermes echoes the ENTIRE input in its TUI as a `Query:` block — including the SYSTEM preamble, `[ROOM MEMBERS]` context, and the user's original message. Without the `in_query_preamble` stateful tracker, all of this leaks into progress messages as raw text. The tracker suppresses everything between `Query:` and the first `┊` line. If the preamble is ever restructured, this tracker must be updated in sync — otherwise the SYSTEM block reappears in progress.
 
-    **Diagnosis:**
-    ```bash
-    # 1. Is Cloudflare reachable?
-    curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 https://im-bot.net/api/health
-    # 521 = origin unreachable. 200 = origin OK, connector problem.
-
-    # 2. Is sun-port listening on 443/80?
-    ssh -p 22 root@138.68.12.68 "ss -tlnp | grep sun-port"
-    # Should show :80, :443, :9090. Empty = sun-port not running.
-
-    # 3. Is the container healthy locally?
-    ssh -p 22 root@138.68.12.68 "curl -s localhost:3001/api/health"
-    # {"status":"ok"} = container is fine, just not reachable from outside.
-    ```
-
-    **Fix — start sun-port:**
-    ```bash
-    ssh -p 22 root@138.68.12.68 "
-    # Kill any stale processes
-    pkill -9 sun-port 2>/dev/null; sleep 1
-
-    # Ensure cert symlinks exist (sun-port reads from /run/sun-port/certs/)
-    mkdir -p /run/sun-port/certs
-    ln -sf /opt/im-bot/sun-port-run/certs/cert.pem /run/sun-port/certs/cert.pem
-    ln -sf /opt/im-bot/sun-port-run/certs/key.pem /run/sun-port/certs/key.pem
-
-    # Start
-    cd /opt/im-bot/sun-port-run && nohup ./sun-port >> sun-port.log 2>&1 &
-    "
-    ```
-
-    **After sun-port is back (verify 443/80 listening):**
-    ```bash
-    ssh -p 22 root@138.68.12.68 "ss -tlnp | grep sun-port"
-    ```
-
-    **Start connectors (supervisord may need explicit 'start' after FATAL):**
-    ```bash
-    supervisorctl start hermes-imbot hermes-imbot-yiman
-    ```
-
-    **Permanent fix — systemd auto-start (deployed 2026-08-08):**
-
-    Both sun-port and landing-page now have systemd services created by `vps-setup.sh`:
-
-    ```bash
-    # sun-port (reverse proxy, TLS termination on :443)
-    cat > /etc/systemd/system/sun-port.service << 'UNIT'
-    [Unit]
-    Description=sun-port reverse proxy
-    After=network-online.target docker.service
-    Wants=network-online.target
-    StartLimitIntervalSec=0
-
-    [Service]
-    Type=simple
-    Restart=always
-    RestartSec=5
-    WorkingDirectory=/opt/im-bot/sun-port-run
-    ExecStartPre=/bin/bash -c 'mkdir -p /run/sun-port/certs && ln -sf /opt/im-bot/sun-port-run/certs/cert.pem /run/sun-port/certs/cert.pem && ln -sf /opt/im-bot/sun-port-run/certs/key.pem /run/sun-port/certs/key.pem'
-    ExecStart=/opt/im-bot/sun-port-run/sun-port
-    StandardOutput=append:/opt/im-bot/sun-port-run/sun-port.log
-    StandardError=append:/opt/im-bot/sun-port-run/sun-port.log
-
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
-
-    # landing-page (static site on 127.0.0.1:9998)
-    cat > /etc/systemd/system/landing-page.service << 'UNIT'
-    [Unit]
-    Description=im-bot landing page (Python HTTP server)
-    After=network-online.target
-    Wants=network-online.target
-
-    [Service]
-    Type=simple
-    Restart=always
-    RestartSec=5
-    WorkingDirectory=/opt/im-bot/landing
-    ExecStart=/usr/bin/python3 -m http.server 9998 --bind 127.0.0.1
-    StandardOutput=append:/tmp/landing.log
-    StandardError=append:/tmp/landing.log
-
-    [Install]
-    WantedBy=multi-user.target
-    UNIT
-
-    systemctl daemon-reload
-    systemctl enable sun-port landing-page
-    ```
-
-    **IMPORTANT:** Do NOT use nginx or LiteSpeed. The VPS reverse proxy is **sun-port** — a custom Pingora-based Go binary at `/opt/im-bot/sun-port-run/sun-port` with config at `/opt/im-bot/sun-port-run/config.yaml`. It round-robins between im-bot-blue (3001) and im-bot-green (3002), terminates TLS with certs from `/run/sun-port/certs/`, and serves the admin UI on port 9090. The certs live at `/opt/im-bot/sun-port-run/certs/` and are symlinked to `/run/sun-port/certs/` on startup.
