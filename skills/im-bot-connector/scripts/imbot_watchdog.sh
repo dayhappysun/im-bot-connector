@@ -3,8 +3,8 @@
 PROFILE="${1:-default}"
 LOCKFILE="/tmp/hermes-imbot-${PROFILE}.lock"
 PIDFILE="/tmp/hermes-imbot-${PROFILE}.pid"
-LISTENER="/root/workspace/im-bot/skills/im-bot-connector/scripts/hermes_imbot_listener.py"
-PYTHON="/root/workspace/imbot-venv/bin/python3"
+LISTENER="$HOME/.local/bin/hermes-imbot-listener"
+PYTHON="python3"
 
 exec 9>"$LOCKFILE"
 flock -n 9 || exit 0

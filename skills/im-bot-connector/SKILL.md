@@ -1,6 +1,6 @@
 --- 
 name: im-bot-connector
-version: 2.15.0
+version: 2.16.0
 description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"
@@ -20,8 +20,7 @@ The connector runs via supervisord. **Do NOT edit workspace copies** — they ar
 
 | Profile | Running Path | Supervisord Name |
 |---------|-------------|------------------|
-| default | `/root/.local/bin/hermes-imbot-listener` | `hermes-imbot` |
-| yiman | `~/.hermes/profiles/yiman/home/.local/bin/hermes-imbot-listener` | `hermes-imbot-yiman` |
+| default | `~/.local/bin/hermes-imbot-listener` | `hermes-imbot` |
 
 Supervisord configs: `/etc/supervisor/conf.d/*.conf`
 
@@ -32,9 +31,6 @@ See also: `references/deployment-workflow.md` for the complete deploy-and-restar
 ```bash
 # Default
 supervisorctl restart hermes-imbot
-
-# Yiman
-supervisorctl restart hermes-imbot-yiman
 ```
 
 ## Backends
@@ -88,7 +84,7 @@ Overall hard cap for the agent run.
 3. Check active connections: `ss -tnp | grep $(pgrep -f hermes-imbot-listener)` — should see both the im-bot server connection AND model API connections. If only API connections exist, the WebSocket is dead
 4. Look for `Disconnected from /agent` patterns — normal with auto-reconnect IF logs show a subsequent `Connected` event. If not, auto-reconnect failed — see Pitfall #13
 5. **Check heartbeat liveness** (since 2026-08-07): the agent's server-side `lastHeartbeatAt` should be within 90s for online agents. If `status='offline'` but `lastHeartbeatAt` is recent, the staleness cron needs investigation. If `lastHeartbeatAt` is old, connector heartbeat isn't reaching the server.
-7. Recovery: `supervisorctl restart hermes-imbot hermes-imbot-yiman` (restart both together)
+7. Recovery: `supervisorctl restart hermes-imbot` (restart both together)
 8. See `references/agent-offline-diagnosis.md` for full workflow
 
 ### "Timeout — denying command" in replies
@@ -200,10 +196,10 @@ environment=IMBOT_BACKEND="hermes",PROGRESS_THROTTLE="3"
 ```
 
 ### Changing timeout value
-Edit the ACTUAL running file (e.g., `/root/.local/bin/hermes-imbot-listener`), NOT the workspace copy. Then restart:
+Edit the ACTUAL running file (e.g., `~/.local/bin/hermes-imbot-listener`), NOT the workspace copy. Then restart:
 
 ```bash
-sed -i "s/IMBOT_AGENT_TIMEOUT.*300/IMBOT_AGENT_TIMEOUT', '3600'/" /root/.local/bin/hermes-imbot-listener
+sed -i "s/IMBOT_AGENT_TIMEOUT.*300/IMBOT_AGENT_TIMEOUT', '3600'/" ~/.local/bin/hermes-imbot-listener
 supervisorctl restart hermes-imbot
 ```
 
@@ -211,15 +207,13 @@ supervisorctl restart hermes-imbot
 
 1. **Source vs running file**: the git-managed sources (`im-bot/skills/im-bot-connector/scripts/` in the im-bot repo, and `skills/im-bot-connector/scripts/` in im-bot-connector-pub) are COPIES. Changing them does nothing until deployed to the actual running file(s). There are MULTIPLE running files — one per profile:
    ```
-   default: /root/.local/bin/hermes-imbot-listener
-   yiman:   /root/.hermes/profiles/yiman/home/.local/bin/hermes-imbot-listener
+   default: ~/.local/bin/hermes-imbot-listener
    ```
    **After editing, sync ALL active profiles** then restart their supervisord entries.
 2. **IMBOT_TIMEOUT ≠ IMBOT_AGENT_TIMEOUT**: One is progress cadence, one is agent timeout. Don't confuse them.
 4. **Per-line progress forwarding causes message floods (fixed v6.4)**: As of v6.4, progress messages are event-driven deltas with six-layer filtering — diffs, TUI borders, long lines, duplicate `┊` status, and empty lines are all filtered. `sent_count` tracking prevents message overlap. The old v6.3 periodic pulse pattern is obsolete.
 5. **Server-side splitMessage compounds flooding**: Prior to the 2026-07-16 fix, `socket/index.ts` split agent replies into 3500-char chunks with `splitMessage()`, broadcasting each as a separate `message:new` event. Combined with per-line progress forwarding, this created message storms. The fix removed `splitMessage` — messages now store and broadcast as single units with a 500KB cap.
-6. **Yiman profile missing hermes binary**: The yiman connector runs with `HOME=/root/.hermes/profiles/yiman`. If `~/.local/bin/hermes` doesn't exist under that home, the connector fails every turn with "Sorry, I had trouble processing that. (session_id: ...)". Fix: `ln -s /root/.local/bin/hermes /root/.hermes/profiles/yiman/home/.local/bin/hermes`. The connector uses `os.path.expanduser('~/.local/bin/...')` to locate the binary — it does NOT search PATH.
-7. **Progress messages are now content-rich deltas (v6.4+)**: As of v6.4, progress messages contain the actual agent stdout output (tool calls, thinking, file reads) — not just "🔄 Working…". Messages are event-driven (sent when new output arrives) and throttled to max one every `PROGRESS_THROTTLE` seconds (default 3s). TUI noise is filtered but meaningful content is shown. The old `IMBOT_TIMEOUT` pulse cadence is no longer used for progress timing.
+6. **Progress messages are now content-rich deltas (v6.4+)**: As of v6.4, progress messages contain the actual agent stdout output (tool calls, thinking, file reads) — not just "🔄 Working…". Messages are event-driven (sent when new output arrives) and throttled to max one every `PROGRESS_THROTTLE` seconds (default 3s). TUI noise is filtered but meaningful content is shown. The old `IMBOT_TIMEOUT` pulse cadence is no longer used for progress timing.
 8. **`-Q` flag intentionally REMOVED (v6.1+)**: Previously the connector used `-Q` to suppress TUI noise. However, `-Q` also suppresses Hermes `┊` progress lines (tool previews) which are the primary source of activity information for progress messages. The connector now runs WITHOUT `-Q`, and `_parse_agent_output()` filters all TUI noise (box-drawing, Query:, footer, AND progress lines). The `┊` lines are extracted for progress during stdout streaming but filtered from the final reply text.
 9. **Session auto-reset on stale/corrupt sessions**: When an agent exits non-zero with an existing session, the connector should auto-reset and retry. Detect these patterns in stderr: `session not found`, `Resumed session`, or empty stdout + `session_id`. Wire the check in `call_agent()` after `proc.returncode != 0`:
    ```python
@@ -294,7 +288,7 @@ supervisorctl restart hermes-imbot
     - `supervisorctl status` shows RUNNING, logs show recent `Welcome` / message processing
     - DB shows agent `status='offline'` with `updatedAt` AFTER the connector's `Welcome` timestamp
     - `ss -tnp | grep <pid>` shows model API connections but im-bot connection may be on a different Cloudflare IP
-    - Recovery: `supervisorctl restart hermes-imbot hermes-imbot-yiman` (restart both together)
+    - Recovery: `supervisorctl restart hermes-imbot` (restart, not just reload)
     
     **Root cause (2026-08-07):** The July 2026 cross-instance guard (`agentRegistry.isOnline()`) only protects the in-memory registry. The **DB race** still happens because `AgentRegistry.unregister()` directly calls `prisma.agent.update({status:'offline'})` in EVERY instance's disconnect handler. When an old connector process is killed (supervisord restart), its disconnect on the old instance writes DB='offline' — this can arrive AFTER the new connector's connect on the new instance wrote DB='online', overwriting it.
     
@@ -323,7 +317,7 @@ supervisorctl restart hermes-imbot
 20. **tool_count detection MUST include `┊` for Hermes**: Hermes uses `┊` (not `Tool:` or `tool_call`) for its progress lines:
     ```
     ┊ 📖 preparing read_file…
-    ┊ 📖 read    /root/workspace/hermes_imbot_listener.py  0.7s
+    ┊ 📖 read    ~/.local/bin/hermes-imbot-listener  0.7s
     ```
     The `tool_count` increment keyword list MUST include `'┊'` alongside `'Tool:'`, `'tool_call'`, `'<｜｜DSML｜｜tool_calls>'`, `'▌'`. Without `'┊'`, `tool_count` stays 0 for the entire run, the tool-call gate never opens, and ALL progress messages are suppressed — including for tool-heavy runs. The fix is a one-character addition to the keyword tuple.
 

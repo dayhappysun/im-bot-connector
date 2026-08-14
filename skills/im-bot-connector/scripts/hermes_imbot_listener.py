@@ -339,7 +339,7 @@ def build_system_preamble():
         "FILE & IMAGE SHARING: You can send images, files, and other media "
         "directly to the chat user. When you generate or save a file, include "
         "MEDIA:/absolute/path/to/file in your reply -- for example: "
-        "MEDIA:/root/workspace/chart.png. The connector automatically uploads "
+        "MEDIA:/tmp/chart.png. The connector automatically uploads "
         "the file as an inline attachment and strips the MEDIA: tag from the "
         "visible message. Supported image formats: PNG, JPG, GIF, WebP, SVG. "
         "Other file types are sent as downloadable attachments.\n\n"
