@@ -215,7 +215,7 @@ supervisorctl restart hermes-imbot
 
 ## Pitfalls
 
-1. **Workspace vs running file**: `/root/workspace/hermes_imbot_listener.py` and `skills/im-bot-connector/scripts/` are COPIES. Changing them does nothing until deployed to the actual running file(s). There are MULTIPLE running files — one per profile:
+1. **Source vs running file**: the git-managed sources (`im-bot/skills/im-bot-connector/scripts/` in the im-bot repo, and `skills/im-bot-connector/scripts/` in im-bot-connector-pub) are COPIES. Changing them does nothing until deployed to the actual running file(s). There are MULTIPLE running files — one per profile:
    ```
    default: /root/.local/bin/hermes-imbot-listener
    yiman:   /root/.hermes/profiles/yiman/home/.local/bin/hermes-imbot-listener
