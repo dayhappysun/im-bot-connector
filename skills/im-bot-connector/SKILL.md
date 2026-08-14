@@ -1,6 +1,6 @@
 --- 
 name: im-bot-connector
-version: 2.12.0
+version: 2.13.0
 description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"

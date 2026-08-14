@@ -11,20 +11,30 @@ Wire format (verified against @deepseek-ai/dsh-acp):
   session/prompt -> {stopReason}  (text streams via session/update events)
   session/update -> {sessionId, update:{sessionUpdate:"agent_message_chunk",
                                          content:{type:"text", text:"..."}}}
+
+History replay (survives connector restarts): the ACP bridge is fresh-only
+(session/new randomUUID, no resume), so a connector restart loses every dsh
+session's in-memory context. To work around this we persist each room's
+conversation to disk and, when a room's session is missing (i.e. after a
+restart), replay that history into the new session as a prefix context before
+sending the real user turn. This preserves the *conversation text* (what the
+model sees) but not dsh-internal tool/fs state.
 """
 import asyncio
 import json
 import os
-import subprocess
-import time
 
 
 class DshAcpClient:
-    def __init__(self, cmd, cwd, log=None, boot_wait=2.0):
+    def __init__(self, cmd, cwd, log=None, boot_wait=2.0,
+                 history_file=None, max_history=20):
         self.cmd = cmd              # shell command to launch the ACP server
         self.cwd = cwd              # absolute cwd for session/new
         self.log = log or (lambda _m: None)
         self.boot_wait = boot_wait
+        self.history_file = history_file or os.path.expanduser(
+            '~/.hermes/dsh_history.json')
+        self.max_history = max_history
         self.proc = None
         self._next_id = 0
         self._pending = {}          # request id -> asyncio.Future
@@ -32,6 +42,8 @@ class DshAcpClient:
         self._chunk_buffers = {}    # sessionId -> list[str] (agent_message_chunk)
         self._reader_task = None
         self._started = False
+        self._history = {}          # room_id -> [{role, text}]
+        self._load_history()
 
     # ── lifecycle ────────────────────────────────────────────────
     async def start(self):
@@ -111,6 +123,41 @@ class DshAcpClient:
             raise RuntimeError('ACP write failed: %s' % e)
         return await asyncio.wait_for(fut, timeout=timeout)
 
+    # ── history persistence (survives connector restarts) ────────
+    def _load_history(self):
+        try:
+            if os.path.exists(self.history_file):
+                with open(self.history_file, 'r', encoding='utf-8') as f:
+                    self._history = json.load(f)
+        except Exception as e:
+            self.log('dsh history load failed: %s' % e)
+            self._history = {}
+
+    def _save_history(self):
+        try:
+            os.makedirs(os.path.dirname(self.history_file), exist_ok=True)
+            tmp = self.history_file + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(self._history, f, ensure_ascii=False)
+            os.replace(tmp, self.history_file)
+        except Exception as e:
+            self.log('dsh history save failed: %s' % e)
+
+    def _append_history(self, room_id, role, text):
+        if not text:
+            return
+        hist = self._history.setdefault(room_id, [])
+        hist.append({'role': role, 'text': text})
+        if len(hist) > self.max_history:
+            self._history[room_id] = hist[-self.max_history:]
+
+    def _build_history_context(self, history):
+        lines = ['[以下是该用户此前的对话历史，用于恢复上下文：]']
+        for entry in history:
+            role = '用户' if entry['role'] == 'user' else '助手'
+            lines.append('%s: %s' % (role, entry['text']))
+        return '\n'.join(lines)
+
     # ── session management ───────────────────────────────────────
     async def session_new(self, room_id):
         resp = await self._request('session/new', {
@@ -125,20 +172,35 @@ class DshAcpClient:
         return sid
 
     async def prompt(self, room_id, text):
-        """Send one user turn to the room's session; return the committed text."""
+        """Send one user turn to the room's session; return the committed text.
+
+        If the room's session is missing (connector restarted → the ACP bridge
+        is fresh), replay the persisted conversation as a prefix context so the
+        model can pick up where it left off.
+        """
         sid = self._sessions.get(room_id)
+        effective = text
         if not sid:
             sid = await self.session_new(room_id)
+            history = self._history.get(room_id, [])
+            if history:
+                ctx = self._build_history_context(history)
+                effective = ctx + '\n\n---\n\n用户最新消息: ' + text
         self._chunk_buffers[sid] = []
         resp = await self._request('session/prompt', {
             'sessionId': sid,
-            'prompt': [{'type': 'text', 'text': text}],
+            'prompt': [{'type': 'text', 'text': effective}],
         })
         if 'error' in resp:
             raise RuntimeError('session/prompt failed: %s' % resp['error'])
         chunks = self._chunk_buffers.get(sid, [])
+        result = ''.join(chunks).strip()
         stop_reason = resp.get('result', {}).get('stopReason', 'unknown')
-        return ''.join(chunks).strip(), stop_reason
+        # Record the *real* turn (not the replayed context) into history.
+        self._append_history(room_id, 'user', text)
+        self._append_history(room_id, 'assistant', result)
+        self._save_history()
+        return result, stop_reason
 
     def has_session(self, room_id):
         return room_id in self._sessions
