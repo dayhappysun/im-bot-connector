@@ -1,6 +1,6 @@
 --- 
 name: im-bot-connector
-version: 2.16.0
+version: 2.17.0
 description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"
@@ -322,4 +322,13 @@ supervisorctl restart hermes-imbot
     The `tool_count` increment keyword list MUST include `'┊'` alongside `'Tool:'`, `'tool_call'`, `'<｜｜DSML｜｜tool_calls>'`, `'▌'`. Without `'┊'`, `tool_count` stays 0 for the entire run, the tool-call gate never opens, and ALL progress messages are suppressed — including for tool-heavy runs. The fix is a one-character addition to the keyword tuple.
 
 21. **`[SYSTEM]` preamble leaks into progress via Hermes TUI echo**: The per-turn `[SYSTEM: ...]` block (see Pitfall #11) is prepended to the agent's input. Hermes echoes the ENTIRE input in its TUI as a `Query:` block — including the SYSTEM preamble, `[ROOM MEMBERS]` context, and the user's original message. Without the `in_query_preamble` stateful tracker, all of this leaks into progress messages as raw text. The tracker suppresses everything between `Query:` and the first `┊` line. If the preamble is ever restructured, this tracker must be updated in sync — otherwise the SYSTEM block reappears in progress.
+
+22. **Generic "Sorry, I didn't get a response" hides provider 429/quota errors** (fixed 2026-08-19): When the model provider returns a 429 (usage-quota exhausted, rate-limit), the connector's fallback paths would mask the real reason. Feishu direct requests get a clear message like `HTTP 429: You have exceeded the 5-hour usage quota. It will reset at 2026-08-19 16:16:42 +0800 CST. We recommend upgrading your plan for more quota, or waiting for the reset.` — but the im-bot reply was `"Sorry, I didn't get a response. Could you try again?"`. Fix: new `_QUOTA_PATTERNS` + `_extract_quota_detail()` + `_friendly_error()` helper detects `429`/`rate[-_]?limit`/`usage[-_]?quota`/`insufficient_quota`/`exceeded`/`api call failed`, extracts the human-readable detail (reset time, upgrade hint), and prepends a Chinese warning header:
+
+    ```
+    ⚠️ 模型调用失败（HTTP 429 限流/配额）。
+    You have exceeded the 5-hour usage quota. It will reset at 2026-08-19 16:16:42 +0800 CST. We recommend upgrading your plan for more quota, or waiting for the reset.
+    ```
+
+    Non-quota errors keep the original generic fallback (no false positives).
 

@@ -484,6 +484,43 @@ def _scan_output(text):
             return True, pat.pattern.replace('\\', '')
     return False, ''
 
+# ── Friendly error surfacing ─────────────────────────────────────────────
+# The model/provider can fail cleanly (e.g. rate-limit / usage quota hit).
+# Instead of a vague "Sorry, I didn't get a response", surface a readable
+# message so the user knows WHY — mirroring what Hermes shows directly on
+# Feishu. Applies on BOTH the non-zero-exit path and the empty-reply path.
+_QUOTA_PATTERNS = re.compile(
+    r'(?i)(\b429\b|rate[-_\s]?limit|usage[-\s]?quota|usage[-\s]?limit|'
+    r'insufficient_quota|exceeded\s+|quota\s+|api call failed)'
+)
+_ID_TRIM = re.compile(r'\bRequest\s*id\s*:?\s*\S*\s*$', re.I)
+
+def _extract_quota_detail(raw):
+    """Pull the informative sentence (quota / reset time / upgrade hint) out of
+    a raw provider error, trimming trailing request-id noise. Returns '' if
+    nothing useful is found to keep the generic fallback."""
+    for marker in ('You have exceeded', 'exceeded the', 'will reset at',
+                   'rate limit reached', 'usage quota', 'insufficient_quota'):
+        i = raw.lower().find(marker.lower())
+        if i >= 0:
+            seg = raw[i:]
+            seg = _ID_TRIM.sub('', seg).strip()
+            return seg[:300]
+    return raw.strip()[:300]
+
+def _friendly_error(raw):
+    """Map a raw agent/provider error into a friendly, informative reply, or
+    None if it isn't a recognizable model/provider failure (keep generic)."""
+    if not raw:
+        return None
+    if not _QUOTA_PATTERNS.search(raw):
+        return None
+    detail = _extract_quota_detail(raw)
+    head = '⚠️ 模型调用失败（HTTP 429 限流/配额）。'
+    if detail:
+        return '%s\n%s' % (head, detail)
+    return '⚠️ 模型调用失败（HTTP 429 限流/配额），请稍后重试或升级套餐。'
+
 def _parse_agent_output(stdout, stderr):
     session_id = None
     # Try stderr first (legacy -Q mode), then stdout footer
@@ -949,6 +986,9 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                     if send_progress:
                         send_progress("🔄 检测到会话过期，正在启动新会话…")
                     return call_agent(content, room_id, send_progress, task_id, _is_retry=True)
+            friendly = _friendly_error(err_msg)
+            if friendly:
+                return friendly
             return "Sorry, I had trouble processing that. (%s)" % err_msg[:100]
 
         # Parse output (backend-specific)
@@ -965,6 +1005,12 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                 log.info("Room %s <-> session %s" % (room_id, final_sid))
 
         if not reply:
+            # Provider may have failed cleanly (e.g. quota) but left a message
+            # only on stderr with exit code 0. Re-read the combined error.
+            combined = (stderr or '') + ' ' + (stdout or '')
+            friendly = _friendly_error(combined)
+            if friendly:
+                return friendly
             return "Sorry, I didn't get a response. Could you try again?"
         # Strip "Timeout — denying command" prefix from agent output
         import re
