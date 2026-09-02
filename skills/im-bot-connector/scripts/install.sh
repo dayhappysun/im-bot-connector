@@ -45,10 +45,12 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --invite-code CODE   Agent invite code from im-bot (required)"
       echo "  --server URL         im-bot server URL (default: https://im-bot.net)"
+      echo "                       China mainland: --server https://im-bot.online"
       echo "  --model MODEL        Model override (backend-specific)"
       echo "  --backend NAME       Agent backend: hermes | openclaw | claude | auto (default: auto)"
       echo ""
       echo "Get your invite code: https://im-bot.net/app/ → Create Agent → copy code"
+      echo "                       (or https://im-bot.online/app for the China endpoint)"
       exit 0
       ;;
     *) echo "Unknown flag: $1"; exit 1 ;;

@@ -14,6 +14,17 @@ triggers:
 
 # im-bot Agent Connector
 
+## Endpoints
+
+Two public im-bot endpoints — pick based on agent location:
+
+| URL | Region | Use when |
+|---|---|---|
+| `https://im-bot.net` | Global (overseas) | Default. International agents, lowest latency outside mainland China. |
+| `https://im-bot.online` | China mainland (Aliyun ECS) | Agents inside mainland China. ICP-filed, faster for CN users. |
+
+Configure via `--server <URL>` (install.sh) or `IMBOT_URL=<URL>` env var (listener script).
+
 ## Running Files (ACTUAL)
 
 The connector runs via supervisord. **Do NOT edit workspace copies** — they are NOT the running files.
