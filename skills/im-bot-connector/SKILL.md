@@ -1,6 +1,6 @@
 --- 
 name: im-bot-connector
-version: 2.17.0
+version: 2.18.0
 description: Manage im-bot agent connectors — configuration, timeouts, progress messages, filtering, troubleshooting, heartbeat-based liveness, and the DeepSeek Harness (dsh) ACP backend
 triggers:
   - "connector timeout/offline/restart"
@@ -342,4 +342,26 @@ supervisorctl restart hermes-imbot
     ```
 
     Non-quota errors keep the original generic fallback (no false positives).
+
+23. **socket.io auto-reconnect hangs for 30+ minutes on aiohttp ws_connect hang** (observed 2026-09-03): `socketio.AsyncClient(reconnection=True, reconnection_delay=3, reconnection_delay_max=60)` configures exponential backoff between reconnect attempts — but the `request_timeout` kwarg defaults to `None`, which means the underlying aiohttp `ClientWSTimeout(ws_close=None)` has NO upper bound on the WebSocket connect itself. When the im-bot server is reachable on TCP but the WebSocket upgrade hangs (Cloudflare 520 during server reboot, partial TLS handshake, server stuck in shutdown), each reconnect attempt blocks indefinitely in `_connect_websocket()` waiting for the ws handshake — the `reconnection_delay` timer never gets a chance to fire.
+
+    **Symptoms:**
+    - `supervisorctl status hermes-imbot` shows RUNNING (process alive)
+    - `tail -5 /tmp/hermes-imbot.log` shows old `Disconnected from /agent` followed by `Traceback ... TimeoutError` then nothing new
+    - All rooms show `agent_status='offline'` on the im-bot UI for 30+ minutes
+    - Recovery requires `supervisorctl restart hermes-imbot` (supervisord's startsecs + autorestart is the only thing that actually unsticks it)
+
+    **Observed timeline (2026-09-03 06:02-06:37 UTC):** 35 minutes of total blackout from a single disconnect.
+
+    **Fix (deployed 2026-09-03):** Pass `request_timeout=10` when constructing `socketio.AsyncClient`. This becomes `aiohttp.ClientWSTimeout(ws_close=10)` inside `_connect_websocket`, capping each WebSocket connect at 10s. Combined with the existing `reconnection_delay=3, max=60` exponential backoff, worst-case cycle is `60s delay + 10s ws timeout = 70s` per attempt — 30 attempts in the 35-minute blackout instead of 0 attempts stuck on the first.
+
+    ```python
+    sio = socketio.AsyncClient(
+        reconnection=True, reconnection_attempts=0,
+        reconnection_delay=3, reconnection_delay_max=60,
+        request_timeout=10,  # aiohttp ws_connect upper bound — prevents the hang
+    )
+    ```
+
+    **Why `reconnection_delay` alone is not enough:** even with a sane `reconnection_delay`, if the delay timer never gets to fire because the previous attempt is still blocked in `ws_connect`, the cycle never advances. The fix has to be at the *attempt* level (timeout on the network operation), not at the *delay* level (backoff between attempts).
 
