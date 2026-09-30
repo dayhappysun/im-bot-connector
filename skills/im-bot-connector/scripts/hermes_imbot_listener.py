@@ -339,7 +339,7 @@ def build_system_preamble():
         "FILE & IMAGE SHARING: You can send images, files, and other media "
         "directly to the chat user. When you generate or save a file, include "
         "MEDIA:/absolute/path/to/file in your reply -- for example: "
-        "MEDIA:/tmp/chart.png. The connector automatically uploads "
+        "MEDIA:/root/workspace/chart.png. The connector automatically uploads "
         "the file as an inline attachment and strips the MEDIA: tag from the "
         "visible message. Supported image formats: PNG, JPG, GIF, WebP, SVG. "
         "Other file types are sent as downloadable attachments.\n\n"
@@ -420,6 +420,46 @@ def build_effective_content(content, attachments):
         lines.append("- %s (%s, %s bytes): %s" % (name, mime, size, url))
     block = "\n".join(lines)
     return (content + "\n\n" + block) if content else block
+
+# BUG3 fix: inject room context (agent-to-agent exchanges + human messages that
+# the agent previously observed but did not reply to) into the prompt so the
+# agent has full conversation context per user's design principle.
+def build_room_log_context(room_id, max_messages=20, max_chars=6000):
+    """Read ~/.hermes/imbot_room_logs/<room_id>.jsonl and return a context block.
+
+    Returns "" if file missing/empty. Trims to most-recent N messages and a
+    total char budget so the injected block can't blow up the prompt.
+    """
+    try:
+        log_path = os.path.join(_ROOM_LOG_DIR, '%s.jsonl' % room_id)
+        if not os.path.isfile(log_path):
+            return ""
+        with open(log_path, 'r') as f:
+            entries = []
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    entries.append(json.loads(line))
+                except Exception:
+                    pass
+        if not entries:
+            return ""
+        recent = entries[-max_messages:]
+        lines = ["[ROOM CONTEXT \u2014 recent observed messages in this room (read-only background)]\n"]
+        for e in recent:
+            sender = e.get('sender', '?')
+            reason = e.get('reason', '')
+            content = e.get('content', '')[:400]
+            lines.append("- (%s) %s: %s" % (reason, sender, content))
+        block = "\n".join(lines)
+        if len(block) > max_chars:
+            block = block[-max_chars:]
+            block = "[...truncated...]\n" + block
+        return block + "\n\n"
+    except Exception as e:
+        log.debug("build_room_log_context: %s" % e)
+        return ""
 
 def _media_file(file_path):
     abs_path = os.path.abspath(os.path.expanduser(file_path))
@@ -1344,10 +1384,13 @@ async def async_main():
 
         if sender_type == 'agent':
             if not was_mentioned:
+                # BUG1 fix: always log agent-to-agent context per user design
+                # ("agent \u603b\u662f\u63a5\u6536\u7fa4\u5185\u6d88\u606f; \u8d85\u8fc7 2 \u4eba\u6ca1 mention \u4e0d\u56de\u590d(\u4f46\u8981\u8bb0\u5f55)")
+                _log_background(room_id, content, sender_name, 'agent-observed')
                 log.info("[%s] Skip: agent msg from %s (not mentioned)" % (room_id[:12], sender_name))
                 return
-            # Agent @@mentioned us — process, but don't log to background
-            # (agent-to-agent context isn't useful for human conversations)
+            # Agent @@mentioned us \u2014 process, and log 'observed' too (was missing)
+            _log_background(room_id, content, sender_name, 'observed')
         else:
             # Human message
             if mentions and not was_mentioned:
@@ -1377,6 +1420,14 @@ async def async_main():
             return
 
         effective = build_effective_content(content, attachments)
+
+        # BUG3 fix: prepend observed room context (last 20 messages from
+        # ~/.hermes/imbot_room_logs/<room_id>.jsonl) so the agent knows
+        # what it previously observed \u2014 including agent-to-agent exchanges
+        # that didn't trigger a reply but are now contextually relevant.
+        room_ctx = build_room_log_context(room_id)
+        if room_ctx:
+            effective = room_ctx + effective
 
         # Interrupt-aware turn scheduling
         with _turn_guard:
