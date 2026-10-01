@@ -166,7 +166,9 @@ _procs_guard = threading.Lock()
 
 # ── Multi-agent guard state ─────────────────────────────────────────────────
 _ROOM_AGENT_COOLDOWN_S  = 3     # seconds — minimum gap between agent messages
-_ROOM_AGENT_STREAK_MAX  = 10    # consecutive agent msgs without human → pause
+_ROOM_AGENT_STREAK_MAX  = 10    # streak threshold where cooldown gets longer
+_ROOM_AGENT_STREAK_DECAY_PER_S = 1.0/60  # streak decays by 1 every 60s of silence
+_ROOM_AGENT_STREAK_MAX_WAIT    = 60    # cap the dynamic wait so it never blocks forever
 _room_last_agent_ts = {}         # room_id -> timestamp of last agent message
 _room_agent_streak  = {}         # room_id -> int, consecutive agent message count
 _room_last_human_ts = {}         # room_id -> timestamp of last human message
@@ -208,26 +210,63 @@ async def build_members_context(room_id):
             lines.append('- 👤 %s' % name)
     return '\n'.join(lines) + '\n\n'
 
-def _guard_check(room_id):
-    """Return True if message should be DROPPED (cooldown or gate triggered)."""
+def _guard_check(room_id, is_human=False):
+    """Return True if message should be DROPPED (cooldown or dynamic gate).
+
+    Human messages are NEVER dropped by the guard — they are the canonical
+    reset signal and must always reach `_guard_bump` so streak returns to 0.
+
+    Agent messages obey:
+      1. Fixed 3s cooldown (prevents echo loops)
+      2. Dynamic wait when streak > MAX (back-pressure, never permanent pause)
+
+    The dynamic wait is min(60, streak * 0.5) seconds since the last agent
+    message. So streak=10 needs 5s gap, streak=20 needs 10s, capped at 60s.
+    This replaces the old "streak>=MAX → permanent pause until human shows up"
+    which could deadlock a room when nobody spoke for a while.
+    """
+    if is_human:
+        # Human: always allowed. Bump will reset streak.
+        return False
     with _guard_lock:
         now = time.time()
-        # Cooldown: at least N seconds between agent messages
         last = _room_last_agent_ts.get(room_id, 0)
+        # Fixed cooldown (still active even at low streak)
         if now - last < _ROOM_AGENT_COOLDOWN_S:
             log.debug("[%s] Guard: cooldown (%.1fs since last agent)" % (room_id[:12], now - last))
             return True
-        # Human gate: if too many agent msgs without human, pause
+        # Dynamic wait when streak has accumulated
         streak = _room_agent_streak.get(room_id, 0)
-        last_human = _room_last_human_ts.get(room_id, 0)
-        if streak >= _ROOM_AGENT_STREAK_MAX and last_human < last:
-            log.warning("[%s] Guard: streak=%d >= %d, no human since streak start — pausing"
-                        % (room_id[:12], streak, _ROOM_AGENT_STREAK_MAX))
-            return True
+        if streak > _ROOM_AGENT_STREAK_MAX:
+            wait = min(_ROOM_AGENT_STREAK_MAX_WAIT, streak * 0.5)
+            if now - last < wait:
+                log.debug("[%s] Guard: streak=%d back-pressure wait %.1fs (last=%.1fs ago)"
+                          % (room_id[:12], streak, wait, now - last))
+                return True
         return False
 
+def _guard_decay_tick():
+    """Background tick: decay streak by elapsed time since last agent msg.
+    Run every 60s. Streak fades naturally so a room that goes silent recovers
+    without needing a human message.
+    """
+    with _guard_lock:
+        now = time.time()
+        for room_id, last_ts in list(_room_last_agent_ts.items()):
+            streak = _room_agent_streak.get(room_id, 0)
+            if streak <= 0:
+                continue
+            elapsed = now - last_ts
+            decay = int(elapsed * _ROOM_AGENT_STREAK_DECAY_PER_S)
+            if decay > 0:
+                _room_agent_streak[room_id] = max(0, streak - decay)
+
 def _guard_bump(room_id, is_human=False):
-    """Update counters after a message passes guard."""
+    """Update counters after a message passes guard.
+    ONLY humans reset it — agent→agent mentions do NOT count (per user policy
+    2026-10-01: 'only human mention of self or others resets streak'). This
+    keeps the guard tight against runaway agent loops.
+    """
     with _guard_lock:
         now = time.time()
         if is_human:
@@ -1318,6 +1357,17 @@ async def _run_turn_async(room_id, effective, task_id, summary, sender_name):
 async def async_main():
     global sio, agent_id, known_rooms, shutting_down, last_rx_ts, last_hb_ts, room_sessions, room_models
 
+    # Background decay loop: every 60s, fade streaks so a silent room recovers
+    # without needing a human to speak. See _guard_decay_tick docstring.
+    async def _decay_loop():
+        try:
+            while not shutting_down:
+                await asyncio.sleep(60)
+                _guard_decay_tick()
+        except asyncio.CancelledError:
+            return
+    decay_task = asyncio.ensure_future(_decay_loop())
+
     sio = socketio.AsyncClient(
         reconnection=True, reconnection_attempts=0,
         reconnection_delay=3, reconnection_delay_max=60,
@@ -1394,12 +1444,12 @@ async def async_main():
 
         # ── Multi-agent guard ───────────────────────────────────────────
         is_human = (sender_type != 'agent')
-        if not is_human:
-            # Agent message: check cooldown + streak gate
-            if _guard_check(room_id):
-                log.info("[%s] Guard: dropped agent message from %s"
-                         % (room_id[:12], sender_name))
-                return
+        # Human messages always pass guard (so streak reset always works).
+        # Agent messages obey cooldown + dynamic back-pressure (see _guard_check).
+        if _guard_check(room_id, is_human=is_human):
+            log.info("[%s] Guard: dropped %s message from %s"
+                     % (room_id[:12], 'human' if is_human else 'agent', sender_name))
+            return
         _guard_bump(room_id, is_human=is_human)
 
         log.info("[%s] Message from %s: %s%s"
