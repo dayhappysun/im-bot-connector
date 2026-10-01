@@ -339,7 +339,7 @@ def build_system_preamble():
         "FILE & IMAGE SHARING: You can send images, files, and other media "
         "directly to the chat user. When you generate or save a file, include "
         "MEDIA:/absolute/path/to/file in your reply -- for example: "
-        "MEDIA:/root/workspace/chart.png. The connector automatically uploads "
+        "MEDIA:/tmp/chart.png. The connector automatically uploads "
         "the file as an inline attachment and strips the MEDIA: tag from the "
         "visible message. Supported image formats: PNG, JPG, GIF, WebP, SVG. "
         "Other file types are sent as downloadable attachments.\n\n"
@@ -445,8 +445,9 @@ def build_room_log_context(room_id, max_messages=20, max_chars=6000):
                     pass
         if not entries:
             return ""
+        # Take last N (most recent) and format
         recent = entries[-max_messages:]
-        lines = ["[ROOM CONTEXT \u2014 recent observed messages in this room (read-only background)]\n"]
+        lines = ["[ROOM CONTEXT — recent observed messages in this room (read-only background)]\n"]
         for e in recent:
             sender = e.get('sender', '?')
             reason = e.get('reason', '')
@@ -902,6 +903,7 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
                 in_diff_block = False  # track multi-line diff segments
                 in_tool_block = False  # suppress verbose tool output (diff/code) between ┊ lines
                 in_query_preamble = False  # suppress Hermes query echo (incl SYSTEM block) until first ┊
+                in_tui_reply_block = False  # suppress content inside ╭╰ reply blocks (handled by _parse_agent_output)
                 for line in proc.stdout:
                     line = line.rstrip('\n\r')
                     stdout_lines.append(line)
@@ -935,6 +937,24 @@ def call_agent(content, room_id, send_progress=None, task_id=None, _is_retry=Fal
 
                     # Skip verbose tool block content
                     if in_tool_block and '┊' not in stripped:
+                        continue
+
+                    # Track TUI reply block boundaries (╭...╰).
+                    # Content inside these blocks IS the final reply (already
+                    # captured by _parse_agent_output at end-of-run) — don't
+                    # leak it into progress messages, or the progress bubble
+                    # ends up duplicating the final text bubble.
+                    # Must run BEFORE _is_tui_noise: the Hermes reply header
+                    # line `╭─ ⚕ Hermes ─...╮` has ╭ as both first and last
+                    # char, so _is_tui_noise returns True for that line and
+                    # we'd never see the boundary marker.
+                    if stripped.startswith('╭'):
+                        in_tui_reply_block = True
+                        continue
+                    if stripped.startswith('╰'):
+                        in_tui_reply_block = False
+                        continue
+                    if in_tui_reply_block:
                         continue
 
                     # Skip TUI noise
@@ -1301,6 +1321,13 @@ async def async_main():
     sio = socketio.AsyncClient(
         reconnection=True, reconnection_attempts=0,
         reconnection_delay=3, reconnection_delay_max=60,
+        # Force a 10s timeout on the underlying aiohttp websocket connect.
+        # Without this, a hung TCP / partial-handshake server hangs the
+        # reconnect loop indefinitely (the AsyncClient defaults
+        # request_timeout=None). 10s + exponential backoff caps a worst-case
+        # reconnect cycle around ~30-40s instead of the observed 35-minute
+        # stall from 2026-09-03. See SKILL.md pitfall #25.
+        request_timeout=10,
     )
 
     @sio.on('connect', namespace='/agent')
@@ -1355,6 +1382,16 @@ async def async_main():
         if not content.strip() and not attachments:
             return
 
+        # ── Progress messages: ignore completely ───────────────────────
+        # Other agents' tool-progress streams (msgType='progress') are pure
+        # UX noise for the chat UI — they must not enter cooldown/streak
+        # guards, must not be logged to room_log (would inflate context),
+        # and must not trigger any reply. Silently return with one debug
+        # line so future audits can still observe the stream.
+        if msg.get('msgType') == 'progress':
+            log.debug("[%s] progress from %s (ignored)" % (room_id[:12] if room_id else '?', sender_name))
+            return
+
         # ── Multi-agent guard ───────────────────────────────────────────
         is_human = (sender_type != 'agent')
         if not is_human:
@@ -1385,11 +1422,11 @@ async def async_main():
         if sender_type == 'agent':
             if not was_mentioned:
                 # BUG1 fix: always log agent-to-agent context per user design
-                # ("agent \u603b\u662f\u63a5\u6536\u7fa4\u5185\u6d88\u606f; \u8d85\u8fc7 2 \u4eba\u6ca1 mention \u4e0d\u56de\u590d(\u4f46\u8981\u8bb0\u5f55)")
+                # ("agent 总是接收群内消息; 超过 2 人没 mention 不回复(但要记录)")
                 _log_background(room_id, content, sender_name, 'agent-observed')
                 log.info("[%s] Skip: agent msg from %s (not mentioned)" % (room_id[:12], sender_name))
                 return
-            # Agent @@mentioned us \u2014 process, and log 'observed' too (was missing)
+            # Agent @@mentioned us — process, and log 'observed' too (was missing)
             _log_background(room_id, content, sender_name, 'observed')
         else:
             # Human message
@@ -1423,7 +1460,7 @@ async def async_main():
 
         # BUG3 fix: prepend observed room context (last 20 messages from
         # ~/.hermes/imbot_room_logs/<room_id>.jsonl) so the agent knows
-        # what it previously observed \u2014 including agent-to-agent exchanges
+        # what it previously observed — including agent-to-agent exchanges
         # that didn't trigger a reply but are now contextually relevant.
         room_ctx = build_room_log_context(room_id)
         if room_ctx:
