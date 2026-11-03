@@ -307,6 +307,11 @@ def _log_background(room_id, content, sender_name, reason='observed'):
 
 
 _SESSION_ID_RE = re.compile(r'^session_id:\s*([0-9a-zA-Z_]+)\s*$')
+# Hermes injects a provider/model switch notice into the reply block when a
+# fallback kicks in. Strip it so it never reaches the chat message.
+_FALLBACK_NOTICE_RE = re.compile(
+    r'^(?:\U0001F504|\u21bb)\s*Switched to fallback(?:\s+model)?\s*:'
+)
 _CLARIFY_RE    = re.compile(r'\[CLARIFY:(\{.*?\})\]', re.DOTALL)
 _MEDIA_RE      = re.compile(r'MEDIA:(/[^\s\n]+)', re.IGNORECASE)
 
@@ -640,6 +645,15 @@ def _parse_agent_output(stdout, stderr):
         if not stripped:
             continue
         if stripped.startswith('Warning:') or stripped.startswith('\u21bb Resumed session'):
+            continue
+        # Hermes injects a one-shot provider/model switch notice INTO the
+        # reply block when the primary model fails and a fallback takes over
+        # (agent/chat_completion_helpers.py::_pending_fallback_notice).
+        # It is operator-facing telemetry, not conversation — drop it so it
+        # never leaks into the chat message the user sees.
+        # Formats seen: "🔄 Switched to fallback model: A via B → C via D",
+        # "↻ Switched to fallback: model (provider)".
+        if _FALLBACK_NOTICE_RE.match(stripped):
             continue
         if _SESSION_ID_RE.match(stripped):
             continue
